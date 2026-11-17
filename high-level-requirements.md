@@ -67,6 +67,16 @@ constraint affects which third-party software licences are acceptable.
   reproduced.
 - **NF-4 Processing time:** images for an uploaded PDF are generated within **2 minutes**
   of the upload completing.
+- **NF-5 Environments:** there are three separate environments: **dev**, **test** and
+  **prod**. Each is deployed from the same infrastructure code, and environments share no
+  data, user accounts or resources (storage, databases, user pools, API endpoints), so
+  work in dev or test can never affect prod. All three environments share a **single AWS
+  account**.
+- **NF-6 UK data residency:** all AWS resources and all data (user data, logs and old
+  object versions) stay in **UK data centres**, which means the AWS Europe (London) region,
+  `eu-west-2`, in every environment. No data is copied or replicated outside the UK. (Some
+  AWS services, such as CloudFront and IAM, are global and hold no user data. How NF-6
+  applies to them is decision DN-1 in [`development-plan.md`](development-plan.md).)
 
 ## 4. Expected usage
 
@@ -89,7 +99,6 @@ To be resolved before choosing a detailed design. Answers will be recorded here.
 - Average SVG size per page (to be measured in the P-2 library tests), which decides SVG
   storage and download costs.
 - Whether data ever needs to be shared between users in future.
-- Custom domain, AWS regions and data-residency constraints.
-- Environments needed (e.g. dev, test, prod).
+- Custom domain.
 - Cost targets, availability targets, backup and retention needs.
 - Compliance needs (e.g. GDPR data export and account deletion).

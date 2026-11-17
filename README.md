@@ -17,6 +17,7 @@ requirements, architecture decisions and designs for everything Take-off needs i
 | Path | Purpose |
 | --- | --- |
 | [`high-level-requirements.md`](high-level-requirements.md) | What the server side must do, and the constraints it must meet. |
+| [`development-plan.md`](development-plan.md) | Build order: scripts, AWS resources and tests for each stage. |
 | [`architecture/`](architecture/) | Architecture diagrams and design documents. |
 | [`architecture/deployment-diagram.md`](architecture/deployment-diagram.md) | Deployment diagram (Mermaid). |
 | [`architecture/decisions.md`](architecture/decisions.md) | Log of architecture decisions. |
