@@ -20,6 +20,8 @@ Decisions that must still be made, and the stage each one blocks, are listed in
   code) and Stages 9–10.
 - **Region:** `eu-west-2` (London) for every environment (NF-6, AD-15). Set in
   `infra/takeoff_infra/config.py` and checked by tests.
+- **AWS account:** `303770518256`, shared by dev, test and prod (AD-14). Set in
+  `infra/takeoff_infra/config.py` and checked by tests.
 - **Domain:** until a custom domain is chosen, each environment uses its CloudFront default
   domain (`https://dxxxx.cloudfront.net`) and its Cognito managed-login prefix domain.
 - **Front end:** the SPA lives in another repository. This plan deploys a placeholder page
@@ -29,12 +31,19 @@ Decisions that must still be made, and the stage each one blocks, are listed in
 ## Repository layout
 
 ```text
-pyproject.toml                    # dependencies, ruff, pytest settings
+pyproject.toml                    # dependencies (uv), ruff, pytest settings
+uv.lock                           # exact versions of every Python package (uv)
+.python-version                   # Python 3.13, used by uv
+package.json                      # CDK CLI (aws-cdk) as a pinned dev dependency, run with npx cdk
+package-lock.json                 # exact CDK CLI version (npm)
+justfile                          # project commands (just): setup, check, deploy, test, scripts
 infra/
   app.py                          # CDK app: builds the stacks for one environment (-c env=dev|test|prod)
+  access_app.py                   # CDK app for the account-wide Takeoff-access stack (takeoff-admin only)
   cdk.json
   takeoff_infra/
     config.py                     # per-environment settings
+    access.py                     # IAM: takeoff-devops user and policies, Takeoff-cf-exec, Takeoff-boundary
     stacks/
       site.py                     # S3 site bucket + CloudFront
       data.py                     # S3 data bucket
@@ -47,7 +56,9 @@ lambdas/
   api/                            # API Lambda
   processing/                     # processing Lambda + Dockerfile
   failure_handler/                # failure-handler Lambda
-scripts/                          # operator and developer scripts
+scripts/
+  dev/                            # developer scripts: build, deploy, test and tune the application
+  ops/                            # operator scripts: tasks done after the application is deployed
 tests/
   conftest.py                     # --env option, stack outputs, test users
   infra/                          # CDK template assertions (no AWS needed)
@@ -64,7 +75,7 @@ There are three layers of automated tests, all in Python with **pytest**:
 | --- | --- | --- | --- |
 | **Infra** | The synthesised CloudFormation template for each stack and each environment has the right resources and settings (encryption, public access blocks, IAM scope, names). | Nothing deployed | `aws_cdk.assertions` |
 | **Unit** | Lambda code logic, including error paths that are hard to cause on purpose in AWS. | Nothing deployed | `pytest`, `moto`, `botocore.stub.Stubber` |
-| **Integration** | Each deployed resource really behaves as required. | A deployed environment: `pytest tests/integration --env dev` | `boto3`, `requests` |
+| **Integration** | Each deployed resource really behaves as required. | A deployed environment: `just integration dev` | `boto3`, `requests` |
 
 Rules:
 
@@ -84,8 +95,29 @@ Rules:
 - **UK residency (NF-6)** is checked at every stage: an infra test fails if any stack is not
   pinned to `eu-west-2`, or if any template names another region (in an ARN, a replication
   rule or a cross-region reference), apart from the global services allowed by DN-1.
-- Every stage also runs `ruff check`, `pytest tests/infra tests/unit`, and
-  `cdk synth -c env=<each env>` before deploying.
+- **Least privilege (AD-17)** is checked at every stage: an infra test fails if any IAM role in
+  any `Takeoff-<env>-*` template lacks the `Takeoff-boundary` permissions boundary, or sets an
+  explicit name that doesn't start with `Takeoff-` (roles without an explicit name get one
+  that starts with the stack name, `Takeoff-<env>-…`).
+- Every stage also runs `just check` before deploying: `ruff check`, `pytest tests/infra
+  tests/unit`, and `just synth <env>` for each environment.
+
+## Deploying
+
+Every deploy goes through `just deploy <env>` (which runs `scripts/dev/deploy.py`), never a bare
+`cdk deploy`. For **prod**, the script first shows the AWS account ID, the IAM user and the
+stacks it will deploy, and asks you to type `prod` to continue; any other answer, or no
+terminal to answer from, cancels the deploy. `infra/app.py` refuses to build prod stacks unless
+the script passes `-c prod_confirmed=yes`, so a mistyped `cdk deploy -c env=prod` fails
+instead of deploying. dev and test deploy without a prompt.
+
+Environment deploys use the `takeoff` profile (`takeoff-devops`), which can only assume the CDK
+roles; CloudFormation then creates resources with the restricted `Takeoff-cf-exec` policy
+(AD-17). **When a stage uses an AWS service or action for the first time**, first add it to
+`Takeoff-cf-exec` (and to `Takeoff-boundary` if a Lambda needs it, or to the `takeoff-devops`
+policy if a script or test needs it) in `infra/takeoff_infra/access.py`, and deploy that with
+`just deploy-access`. That command uses the `takeoff-admin` profile and asks
+for the same typed confirmation as prod.
 
 ---
 
@@ -93,34 +125,124 @@ Rules:
 
 **Goal:** a working toolchain and an AWS account ready for CDK deployments (NF-3, NF-5).
 
-**Python files**
+**Tools needed on the developer machine:** just, uv, Node.js (LTS), and AWS CLI v2 2.32.0 or
+later (for `aws login`).
 
-- `pyproject.toml`: `aws-cdk-lib`, `constructs`, `boto3`, `pytest`, `moto`, `requests`, `ruff`.
+**Files**
+
+- `justfile` (AD-20): the project's commands. On Windows, recipes run in PowerShell
+  (`set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]`). Stage 0 recipes:
+
+  | Recipe | Runs |
+  | --- | --- |
+  | `just` | lists the recipes |
+  | `just setup` | `uv sync`, `npm ci` |
+  | `just lint` | `uv run ruff check` and `ruff format --check` |
+  | `just test` | `uv run pytest tests/infra tests/unit` |
+  | `just synth <env>` | `uv run python scripts/dev/deploy.py synth <env>` |
+  | `just check` | `lint`, `test`, then `synth` for dev, test and prod |
+  | `just deploy <env>` | `uv run python scripts/dev/deploy.py deploy <env>` |
+  | `just deploy-access` | `uv run python scripts/dev/deploy.py access` |
+  | `just bootstrap` | `npx cdk bootstrap aws://303770518256/eu-west-2 --profile takeoff-admin --cloudformation-execution-policies arn:aws:iam::303770518256:policy/Takeoff-cf-exec` |
+  | `just login [profile]` | `aws login --profile <profile>` (default `takeoff`) |
+  | `just integration <env>` | `uv run pytest tests/integration --env <env>` |
+  | `just outputs <env>` | `uv run python scripts/dev/stack_outputs.py <env>` |
+
+  Recipes only call the scripts; safety checks such as the prod confirmation stay in
+  `deploy.py`. Each later stage adds a recipe for every script it adds (for example
+  `just make-test-pdfs`, `just upload-site <env> <build dir>`, `just set-idp-secrets <env>`,
+  `just power-tune`, `just smoke <env>`).
+
+- `pyproject.toml`, `uv.lock` and `.python-version` (AD-18): runtime dependencies `aws-cdk-lib`,
+  `constructs`, `boto3`; a `dev` dependency group with `pytest`, `moto`, `requests`, `ruff`.
+  Created with `uv init`, `uv python pin 3.13` and `uv add`; `uv sync` sets up `.venv`.
+- `package.json` and `package-lock.json` (AD-19): `aws-cdk` (the CDK CLI) as an exact-version
+  dev dependency, installed with `npm ci`; nothing else. `.gitignore` excludes
+  `node_modules/`, `.venv/` and `infra/cdk.out/`.
 - `infra/app.py`: reads `-c env=…`, refuses unknown names, sets stack names to `Takeoff-<env>-<Stack>`.
-- `infra/takeoff_infra/config.py`: an `EnvConfig` dataclass per environment: region, name
-  prefix (`takeoff-dev`), removal policy (dev/test destroy, prod retain), allowed CORS origins,
+  For `env=prod` it exits with an error unless `-c prod_confirmed=yes` is set (see
+  [Deploying](#deploying)). Stacks are built by a function that the infra tests call directly,
+  so the tests don't need this flag.
+- `scripts/dev/deploy.py`: `synth <env>` and `deploy <env>` run `npx cdk synth` /
+  `npx cdk deploy --all` (`npx.cmd` on Windows) for one environment with the `takeoff`
+  profile, and stops if the profile's account isn't `303770518256`. `deploy prod` asks for
+  typed confirmation first; `synth prod` doesn't (it deploys nothing). Both pass `-c prod_confirmed=yes` for prod.
+  `access` deploys `infra/access_app.py` with the `takeoff-admin` profile, after the same typed
+  confirmation.
+- `infra/takeoff_infra/access.py` and `infra/access_app.py`: the `Takeoff-access` stack (AD-17).
+  It uses `CliCredentialsStackSynthesizer`, so `takeoff-admin` deploys it with its own
+  credentials and it never goes through the CDK roles. It contains:
+  - `Takeoff-cf-exec`: the CloudFormation execution policy. Services used by the stacks only,
+    regional actions only in `eu-west-2` (plus DN-1's global services), `iam:CreateRole` only
+    for `Takeoff-*` roles with the `Takeoff-boundary` boundary; denies changes to boundaries
+    and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 2 needs;
+    later stages add to it.
+  - `Takeoff-boundary`: the permissions boundary for every role the CDK app creates.
+  - The `takeoff-devops` IAM user (password and MFA are set by hand in the console), with a
+    policy allowing `sts:AssumeRole` on `cdk-hnb659fds-*` roles only, and a scoped policy
+    for scripts and tests (CloudFormation describe on `Takeoff-*`; later stages add Cognito
+    test users, S3 on the Take-off buckets, CloudFront invalidation, `takeoff/*` secrets,
+    Lambda invoke, SQS read, the IAM policy simulator, Resource Groups Tagging read and
+    starting the Power Tuning state machine).
+- `infra/cdk.json`: runs the app with `uv run python app.py`, and sets
+  `@aws-cdk/core:permissionsBoundary` to `Takeoff-boundary`.
+- `infra/takeoff_infra/config.py`: an `EnvConfig` dataclass per environment: account
+  (`303770518256`), region, name prefix (`takeoff-dev`), removal policy (dev/test destroy, prod retain), allowed CORS origins,
   whether the test app client is created.
 - `tests/conftest.py`: `--env` option, prod guard, stack-output fixture.
 - `tests/resource_coverage.py`, `tests/infra/test_resource_coverage.py`.
-- `scripts/stack_outputs.py`: prints the outputs of every stack for one environment (used by
+- `scripts/dev/stack_outputs.py`: prints the outputs of every stack for one environment (used by
   scripts and tests).
 
 **AWS resources**
 
-- CDK bootstrap stack (`CDKToolkit`) in `eu-west-2` only, once for the shared account.
-- An IAM user or SSO role for deployment. Developers use named AWS CLI profiles.
+In this order:
+
+1. With the root user: create the IAM user **`takeoff-admin`** (console password, MFA,
+   `AdministratorAccess`), then stop using the root user. AWS CLI profile `takeoff-admin`,
+   signed in with `just login takeoff-admin`.
+2. With `takeoff-admin`: deploy the **`Takeoff-access`** stack (`just deploy-access`): the
+   `Takeoff-cf-exec` and `Takeoff-boundary` policies and the **`takeoff-devops`** user and
+   its policies. Then set `takeoff-devops`'s console password and MFA.
+3. With `takeoff-admin`: **CDK bootstrap** (`CDKToolkit`) in `eu-west-2` only, once for the
+   shared account, with `just bootstrap` (uses the `Takeoff-cf-exec` execution policy).
+4. AWS CLI profile **`takeoff`** (region `eu-west-2`) for `takeoff-devops`, signed in with
+   `just login`. It is used for every deploy, script and test from here on (AD-16).
 
 **Automated tests**
 
-- Unit: `config.py` gives three environments with different name prefixes, all in `eu-west-2`; prod retains data;
+- Unit: `config.py` gives three environments with different name prefixes, all in account
+  `303770518256` and `eu-west-2`; prod retains data;
   only dev and test enable the test app client; unknown environment names are rejected.
+- Unit: `app.py` exits with an error for `env=prod` without `prod_confirmed=yes`, and builds
+  dev and test without it. `deploy.py deploy prod` cancels on any answer other than `prod`
+  and when there is no terminal, and never prompts for dev, test or `synth prod`.
+- Infra (`tests/infra/test_access.py`): `Takeoff-cf-exec` has no `"Action": "*"` and no
+  `iam:*`; `iam:CreateRole` requires the `Takeoff-boundary` boundary and a `Takeoff-*` name;
+  boundary changes and edits to the access policies are denied; regional actions are limited
+  to `eu-west-2`. `takeoff-devops` has no `AdministratorAccess`, no IAM write actions, and
+  `sts:AssumeRole` only on `cdk-hnb659fds-*`. `cdk.json` sets the permissions boundary.
 - Integration: the `CDKToolkit` stack exists in `eu-west-2` and is `CREATE_COMPLETE` or
-  `UPDATE_COMPLETE`.
+  `UPDATE_COMPLETE`, and its CloudFormation execution role has `Takeoff-cf-exec`, not
+  `AdministratorAccess`.
+- Integration (`tests/integration/test_access.py`, run as `takeoff-devops`): the IAM policy
+  simulator denies `takeoff-devops` `iam:CreateUser`, `iam:AttachUserPolicy` and
+  `iam:CreateRole`, and denies `Takeoff-cf-exec` creating a role without the boundary or
+  with a non-`Takeoff-*` name.
 
 **Manual / sanity checks**
 
-- `aws sts get-caller-identity` shows the expected account.
-- `cdk synth -c env=dev` runs cleanly (no stacks yet).
+- `just` lists the recipes; `just setup` runs cleanly; `npx cdk --version` prints the version
+  in `package-lock.json`.
+- The CDK CLI accepts `aws login` credentials: `just deploy-access` and `just bootstrap` succeed
+  with the `takeoff-admin` profile. If they don't, upgrade `aws-cdk`, or have `deploy.py` pass
+  the credentials from `aws configure export-credentials --profile <profile> --format env`.
+- `aws login --profile takeoff` succeeds, and `aws sts get-caller-identity --profile takeoff`
+  shows account `303770518256` and the IAM user `takeoff-devops`.
+- The root user and `takeoff-admin` both have MFA; the root user has no access keys.
+- As `takeoff-devops`, `aws iam list-users` is denied (it has no IAM admin rights).
+- `just check` runs cleanly (no stacks yet).
+- `npx cdk synth -c env=prod` (without the script) fails with the prod-confirmation error.
 
 ---
 
@@ -131,12 +253,12 @@ code is built. Nothing is deployed.
 
 **Python files**
 
-- `scripts/make_test_pdfs.py`: generates the fixtures in `tests/fixtures/pdfs/`: 1, 4, 20 and
+- `scripts/dev/make_test_pdfs.py`: generates the fixtures in `tests/fixtures/pdfs/`: 1, 4, 20 and
   21 pages, one close to 20 MB, a corrupt file, a non-PDF renamed `.pdf`, and a
   password-protected PDF. Real sample drawings from the owner are added beside them.
 - `lambdas/processing/render.py`: `render_page(pdf_path, page, out_path)` that wraps
   `pdftocairo -svg -f n -l n`, and `count_pages(pdf_path)`.
-- `scripts/spike_render.py`: renders every fixture and prints time per page, SVG size per page,
+- `scripts/dev/spike_render.py`: renders every fixture and prints time per page, SVG size per page,
   and peak memory.
 
 **AWS resources:** none.
@@ -164,7 +286,7 @@ code is built. Nothing is deployed.
 - `infra/takeoff_infra/stacks/site.py`: private, encrypted site bucket with all public access
   blocked; CloudFront distribution with Origin Access Control, HTTPS only, and 403/404 mapped
   to `/index.html` with status 200; outputs `SiteBucketName`, `DistributionId`, `SiteUrl`.
-- `scripts/upload_site.py`: uploads a SvelteKit build folder to the site bucket (long cache
+- `scripts/dev/upload_site.py`: uploads a SvelteKit build folder to the site bucket (long cache
   for hashed assets, no cache for `index.html`), writes `config.json` (API URL, Cognito
   details from stack outputs), and invalidates CloudFront.
 - `site_placeholder/index.html`: a placeholder page used until the real SPA is deployed.
@@ -175,8 +297,8 @@ code is built. Nothing is deployed.
   allowing only that distribution.
 - CloudFront is a global service: it caches the public SPA files at edge locations outside
   the UK. It never handles user data, because API calls and file transfers go straight to
-  `eu-west-2`. Whether this is acceptable under NF-6 is **DN-1**, which must be decided
-  before this stage.
+  `eu-west-2`. NF-6 currently allows this as a provisional exception; DN-1 is still to be
+  confirmed.
 
 **Automated tests**
 
@@ -245,7 +367,7 @@ code is built. Nothing is deployed.
   secret, callback and sign-out URLs from the site URL, plus localhost in dev); a test-only
   app client with `ADMIN_USER_PASSWORD_AUTH` (dev and test only); no account linking.
   Outputs `UserPoolId`, `SpaClientId`, `TestClientId`, `LoginDomain`.
-- `scripts/set_idp_secrets.py`: stores the Google and Facebook client ID and secret for an
+- `scripts/ops/set_idp_secrets.py`: stores the Google and Facebook client ID and secret for an
   environment in Secrets Manager (`takeoff/<env>/google`, `takeoff/<env>/facebook`). Run
   once per environment before deploying.
 - `tests/conftest.py`: adds the `test_user` and `second_test_user` fixtures that create users,
@@ -421,7 +543,8 @@ code is built. Nothing is deployed.
 
 **Python files**
 
-- `lambdas/processing/Dockerfile`: AWS Python 3.13 arm64 base image plus Poppler.
+- `lambdas/processing/Dockerfile`: AWS Python 3.13 arm64 base image plus Poppler. Python
+  dependencies come from a `requirements.txt` exported from `uv.lock` (`uv export`, AD-18).
 - `lambdas/processing/handler.py`: handles the S3 `ObjectCreated` event; checks the key matches
   `users/{sub}/projects/{id}/pdf/{fileId}.pdf` (ignores anything else); writes
   `status: processing`; checks page count (over 20 pages or invalid PDF → `failed`, delete
@@ -533,8 +656,11 @@ affecting each other (AD-14).
   messages in the failure queue's DLQ; log retention on every log group (for example
   30 days in dev and test, 1 year in prod); reserved concurrency for dev and test Lambdas
   so they can't use up prod's capacity; an AWS Budgets alert.
-- `scripts/power_tune.py`: deploys and runs AWS Lambda Power Tuning against the processing
-  Lambda using the fixture PDFs, and prints the recommended memory size (P-4).
+- `scripts/dev/power_tune.py`: runs AWS Lambda Power Tuning against the processing Lambda
+  using the fixture PDFs, and prints the recommended memory size (P-4). The Power Tuning state
+  machine is deployed by CDK in a dev-only stack, so its roles follow AD-17 (named
+  `Takeoff-*`, with `Takeoff-boundary`). Add Step Functions to `Takeoff-cf-exec` and
+  `Takeoff-boundary` first.
 
 **AWS resources**
 
@@ -553,7 +679,7 @@ affecting each other (AD-14).
 **Manual / sanity checks**
 
 - Confirm the alarm email subscription.
-- Run `scripts/power_tune.py`, update the memory settings, and record the result in
+- Run `just power-tune`, update the memory settings, and record the result in
   `decisions.md` (confirms P-4).
 
 ---
@@ -570,14 +696,15 @@ affecting each other (AD-14).
 - `tests/integration/test_environment_isolation.py`: compares the stack outputs of all
   environments and checks that no bucket, User Pool, API or Lambda is shared, and that each
   Lambda role cannot reach another environment's bucket (IAM policy simulator).
-- `scripts/smoke_test.py`: runs the right suite for an environment (integration for dev and
+- `scripts/dev/smoke_test.py`: runs the right suite for an environment (integration for dev and
   test, smoke for prod).
 - `infra/takeoff_infra/config.py`: final settings for test and prod (retain policies, no test
   client in prod, Cognito email through SES for prod if a domain is available).
 
 **AWS resources**
 
-- Every stack from Stages 2–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`.
+- Every stack from Stages 2–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
+  `scripts/dev/deploy.py` (prod asks for confirmation).
 - Identity-provider secrets and Google/Facebook redirect URLs for test and prod.
 - SES identity for prod emails (depends on the custom-domain decision); without it, Cognito's
   default email sender has a low daily limit.
@@ -609,8 +736,7 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 
 | # | Decision | Needed by | Current assumption / options | Notes |
 | --- | --- | --- | --- | --- |
-| DN-1 | **How NF-6 (UK residency) applies to AWS global services.** These hold configuration and public files, not user data: **CloudFront** (caches the SPA at edge locations worldwide), **IAM**, **AWS Budgets**, and, with a custom domain, **Route 53** and the **ACM certificates** that CloudFront and Cognito custom domains must have in **`us-east-1`** | Stage 0 (before Stage 2) | Allow these as named exceptions, because no user data passes through or is stored in them. | The alternative to CloudFront is serving the SPA from a UK-only service (for example API Gateway or a load balancer in front of the S3 bucket). That costs more, is slower for users, and is more work. A `us-east-1` certificate also needs CDK bootstrapped in `us-east-1`. Once decided, write the exceptions into NF-6. |
-| DN-2 | **Deployment access** to the shared account: who may deploy to each environment, and how (IAM Identity Center, roles per environment) | Stage 0 | Named CLI profiles for developers. | With one account (AD-14), stopping a dev deploy from touching prod relies on IAM and process, not account boundaries. |
+| DN-1 | **How NF-6 (UK residency) applies to AWS global services.** These hold configuration and public files, not user data: **CloudFront** (caches the SPA at edge locations worldwide), **IAM**, **AWS Budgets**, and, with a custom domain, **Route 53** and the **ACM certificates** that CloudFront and Cognito custom domains must have in **`us-east-1`** | Confirm before prod launch (Stage 13) | **Provisionally accepted**: listed as named exceptions in NF-6, because no user data passes through or is stored in them. | The alternative to CloudFront is serving the SPA from a UK-only service (for example API Gateway or a load balancer in front of the S3 bucket). That costs more, is slower for users, and is more work. A `us-east-1` certificate also needs CDK bootstrapped in `us-east-1`. If DN-1 is rejected, Stage 2 must be redesigned. |
 | DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 1 (before Stage 9) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
 | DN-4 | **Custom domain** for the SPA, API and sign-in pages | Stage 2 (can be added later, at the cost of reconfiguration) | CloudFront and Cognito default domains. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Needs certificates in `us-east-1` (DN-1). Changing it later means updating all of those in every environment. |
 | DN-5 | **ID format** for projects and files | Stage 3 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
@@ -633,6 +759,6 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 
 ## Not covered by this plan
 
-- A CI/CD pipeline. Deployments are run with `cdk deploy` from a developer machine.
+- A CI/CD pipeline. Deployments are run with `scripts/dev/deploy.py` from a developer machine.
 - A custom domain, data-residency rules, GDPR export and account deletion, and backups
   beyond S3 versioning. These depend on open questions in `high-level-requirements.md`.

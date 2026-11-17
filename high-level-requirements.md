@@ -74,9 +74,21 @@ constraint affects which third-party software licences are acceptable.
   account**.
 - **NF-6 UK data residency:** all AWS resources and all data (user data, logs and old
   object versions) stay in **UK data centres**, which means the AWS Europe (London) region,
-  `eu-west-2`, in every environment. No data is copied or replicated outside the UK. (Some
-  AWS services, such as CloudFront and IAM, are global and hold no user data. How NF-6
-  applies to them is decision DN-1 in [`development-plan.md`](development-plan.md).)
+  `eu-west-2`, in every environment. No data is copied or replicated outside the UK.
+
+  **Exceptions (provisional, pending confirmation of DN-1 in
+  [`development-plan.md`](development-plan.md)):** these AWS global services may be used,
+  because they hold only configuration or public files and **no user data passes through or
+  is stored in them**:
+  - **CloudFront**, which serves the SPA and caches its public files at edge locations
+    outside the UK;
+  - **IAM**, for accounts, roles and policies;
+  - **AWS Budgets**, for cost alerts;
+  - if a custom domain is used: **Route 53**, and the **ACM certificates** that CloudFront and
+    Cognito custom domains must have in `us-east-1`.
+
+  User data (accounts, projects, PDFs, images, JSON files, logs) must never be held by,
+  or sent through, any of these exceptions.
 
 ## 4. Expected usage
 
