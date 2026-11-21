@@ -43,7 +43,7 @@ infra/
   cdk.json
   takeoff_infra/
     config.py                     # per-environment settings
-    access.py                     # IAM: takeoff-devops user and policies, Takeoff-cf-exec, Takeoff-boundary
+    access.py                     # IAM managed policies only: Takeoff-cf-exec, Takeoff-boundary, takeoff-devops's policies
     stacks/
       site.py                     # S3 site bucket + CloudFront
       data.py                     # S3 data bucket
@@ -114,10 +114,14 @@ instead of deploying. dev and test deploy without a prompt.
 Environment deploys use the `takeoff` profile (`takeoff-devops`), which can only assume the CDK
 roles; CloudFormation then creates resources with the restricted `Takeoff-cf-exec` policy
 (AD-17). **When a stage uses an AWS service or action for the first time**, first add it to
-`Takeoff-cf-exec` (and to `Takeoff-boundary` if a Lambda needs it, or to the `takeoff-devops`
-policy if a script or test needs it) in `infra/takeoff_infra/access.py`, and deploy that with
-`just deploy-access`. That command uses the `takeoff-admin` profile and asks
-for the same typed confirmation as prod.
+`Takeoff-cf-exec` (and to `Takeoff-boundary` if a Lambda needs it, or to
+`Takeoff-devops-scripts` if a script or test needs it) in `infra/takeoff_infra/access.py`, and
+deploy that with `just deploy-access`. That command uses the `takeoff-admin` profile and asks
+for the same typed confirmation as prod. Changing a policy's contents is enough: the
+administrator attached it once, and the attachment stays. Keep the policy names unchanged.
+If a change needs a **new** policy (for example because `Takeoff-devops-scripts` reaches IAM's
+6,144-character limit), deploy it with `just deploy-access`, then ask the administrator to
+attach it (AD-17).
 
 ---
 
@@ -143,7 +147,7 @@ later (for `aws login`).
   | `just check` | `lint`, `test`, then `synth` for dev, test and prod |
   | `just deploy <env>` | `uv run python scripts/dev/deploy.py deploy <env>` |
   | `just deploy-access` | `uv run python scripts/dev/deploy.py access` |
-  | `just bootstrap` | `npx cdk bootstrap aws://303770518256/eu-west-2 --profile takeoff-admin --cloudformation-execution-policies arn:aws:iam::303770518256:policy/Takeoff-cf-exec` |
+  | `just bootstrap <profile>` | `npx cdk bootstrap aws://303770518256/eu-west-2 --profile <profile> --cloudformation-execution-policies arn:aws:iam::303770518256:policy/Takeoff-cf-exec`, run by the administrator with its own profile (AD-17) |
   | `just login [profile]` | `aws login --profile <profile>` (default `takeoff`) |
   | `just integration <env>` | `uv run pytest tests/integration --env <env>` |
   | `just outputs <env>` | `uv run python scripts/dev/stack_outputs.py <env>` |
@@ -170,20 +174,26 @@ later (for `aws login`).
   `access` deploys `infra/access_app.py` with the `takeoff-admin` profile, after the same typed
   confirmation.
 - `infra/takeoff_infra/access.py` and `infra/access_app.py`: the `Takeoff-access` stack (AD-17).
-  It uses `CliCredentialsStackSynthesizer`, so `takeoff-admin` deploys it with its own
-  credentials and it never goes through the CDK roles. It contains:
+  It uses `LegacyStackSynthesizer`, so `takeoff-admin` deploys it with its own
+  credentials, it never goes through the CDK roles, and the template is sent inline (no
+  upload to the bootstrap bucket). It can therefore be deployed before the CDK bootstrap,
+  which needs `Takeoff-cf-exec`. (`CliCredentialsStackSynthesizer` uploads the template to the
+  bootstrap bucket and `BootstraplessSynthesizer` uses the bootstrap roles, so neither works.)
+  It contains **only customer managed policies, with no users and no attachments** (no
+  `Users`, `Groups` or `Roles` on any policy). The `takeoff-devops` user is created, and its
+  policies attached, by hand by the administrator (AD-17), so the policy names must never
+  change:
   - `Takeoff-cf-exec`: the CloudFormation execution policy. Services used by the stacks only,
     regional actions only in `eu-west-2` (plus DN-1's global services), `iam:CreateRole` only
     for `Takeoff-*` roles with the `Takeoff-boundary` boundary; denies changes to boundaries
     and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 2 needs;
     later stages add to it.
   - `Takeoff-boundary`: the permissions boundary for every role the CDK app creates.
-  - The `takeoff-devops` IAM user (password and MFA are set by hand in the console), with a
-    policy allowing `sts:AssumeRole` on `cdk-hnb659fds-*` roles only, and a scoped policy
-    for scripts and tests (CloudFormation describe on `Takeoff-*`; later stages add Cognito
-    test users, S3 on the Take-off buckets, CloudFront invalidation, `takeoff/*` secrets,
-    Lambda invoke, SQS read, the IAM policy simulator, Resource Groups Tagging read and
-    starting the Power Tuning state machine).
+  - `Takeoff-devops-cdk`: `sts:AssumeRole` on `cdk-hnb659fds-*` roles only.
+  - `Takeoff-devops-scripts`: a scoped policy for scripts and tests (CloudFormation describe
+    on `Takeoff-*`; later stages add Cognito test users, S3 on the Take-off buckets,
+    CloudFront invalidation, `takeoff/*` secrets, Lambda invoke, SQS read, the IAM policy
+    simulator, Resource Groups Tagging read and starting the Power Tuning state machine).
 - `infra/cdk.json`: runs the app with `uv run python app.py`, and sets
   `@aws-cdk/core:permissionsBoundary` to `Takeoff-boundary`.
 - `infra/takeoff_infra/config.py`: an `EnvConfig` dataclass per environment: account
@@ -196,17 +206,32 @@ later (for `aws login`).
 
 **AWS resources**
 
+The **administrator** is a separate IAM user that is managed outside this project (AD-17).
+The plan assumes it exists. Every step that creates or changes a user, or attaches a policy
+to a user or role, is the administrator's.
+
 In this order:
 
-1. With the root user: create the IAM user **`takeoff-admin`** (console password, MFA,
-   `AdministratorAccess`), then stop using the root user. AWS CLI profile `takeoff-admin`,
-   signed in with `just login takeoff-admin`.
-2. With `takeoff-admin`: deploy the **`Takeoff-access`** stack (`just deploy-access`): the
-   `Takeoff-cf-exec` and `Takeoff-boundary` policies and the **`takeoff-devops`** user and
-   its policies. Then set `takeoff-devops`'s console password and MFA.
-3. With `takeoff-admin`: **CDK bootstrap** (`CDKToolkit`) in `eu-west-2` only, once for the
-   shared account, with `just bootstrap` (uses the `Takeoff-cf-exec` execution policy).
-4. AWS CLI profile **`takeoff`** (region `eu-west-2`) for `takeoff-devops`, signed in with
+1. **Administrator, by hand:** create the customer managed policy **`TakeoffAppPlatform`** from
+   `infra/policies/TakeoffAppPlatform.json`, and the IAM user **`takeoff-admin`** (console
+   password, MFA, `SignInLocalDevelopmentAccess` and `TakeoffAppPlatform` attached). AWS CLI
+   profile `takeoff-admin`, signed in with `just login takeoff-admin`. `TakeoffAppPlatform`
+   allows exactly step 2: the `Takeoff-access` stack and the `Takeoff-*` managed policies
+   (create, read, new versions, tags, delete). It allows **nothing** on users or roles, and no
+   policy attachment. Its name is deliberately outside `Takeoff-*`, so `takeoff-admin` can't
+   edit its own policy. When a later stage adds a resource type to `Takeoff-access`, the
+   administrator first adds its permissions to `TakeoffAppPlatform`
+   (`tests/infra/test_admin_policy.py` fails until then).
+2. **`takeoff-admin`:** deploy the **`Takeoff-access`** stack (`just deploy-access`): the
+   `Takeoff-cf-exec`, `Takeoff-boundary`, `Takeoff-devops-cdk` and `Takeoff-devops-scripts`
+   policies, none of them attached.
+3. **Administrator, by hand (not part of any stack):** create the IAM user
+   **`takeoff-devops`** (console password and MFA), and attach exactly
+   `SignInLocalDevelopmentAccess`, `Takeoff-devops-cdk` and `Takeoff-devops-scripts`.
+4. **Administrator:** **CDK bootstrap** (`CDKToolkit`) in `eu-west-2` only, once for the
+   shared account, with `just bootstrap <administrator profile>` (uses the `Takeoff-cf-exec`
+   execution policy). The administrator also runs any later bootstrap upgrade.
+5. AWS CLI profile **`takeoff`** (region `eu-west-2`) for `takeoff-devops`, signed in with
    `just login`. It is used for every deploy, script and test from here on (AD-16).
 
 **Automated tests**
@@ -220,13 +245,25 @@ In this order:
 - Infra (`tests/infra/test_access.py`): `Takeoff-cf-exec` has no `"Action": "*"` and no
   `iam:*`; `iam:CreateRole` requires the `Takeoff-boundary` boundary and a `Takeoff-*` name;
   boundary changes and edits to the access policies are denied; regional actions are limited
-  to `eu-west-2`. `takeoff-devops` has no `AdministratorAccess`, no IAM write actions, and
-  `sts:AssumeRole` only on `cdk-hnb659fds-*`. `cdk.json` sets the permissions boundary.
+  to `eu-west-2`. The `takeoff-devops` policies have no `AdministratorAccess`, no IAM write
+  actions, and `sts:AssumeRole` only on `cdk-hnb659fds-*`. The `Takeoff-access` template
+  contains only `AWS::IAM::ManagedPolicy` resources, none with `Users`, `Groups` or `Roles`.
+  `cdk.json` sets the permissions boundary.
+- Infra (`tests/infra/test_admin_policy.py`): `TakeoffAppPlatform` is valid and within IAM's
+  size limit; it allows no action on `user/*`, `role/*` or `group/*` resources, and none of
+  `iam:Attach*Policy`, `iam:Detach*Policy`, `iam:Put*Policy`, `iam:Delete*Policy` (apart from
+  `iam:DeletePolicy` itself), `iam:*PermissionsBoundary`, `iam:CreateUser`, `iam:CreateRole`,
+  `iam:*LoginProfile`, `iam:*AccessKey` or `iam:*MFADevice`; its name is outside the
+  `Takeoff-*` pattern it may edit; it covers every resource type in the `Takeoff-access`
+  template.
 - Integration: the `CDKToolkit` stack exists in `eu-west-2` and is `CREATE_COMPLETE` or
   `UPDATE_COMPLETE`, and its CloudFormation execution role has `Takeoff-cf-exec`, not
   `AdministratorAccess`.
-- Integration (`tests/integration/test_access.py`, run as `takeoff-devops`): the IAM policy
-  simulator denies `takeoff-devops` `iam:CreateUser`, `iam:AttachUserPolicy` and
+- Integration (`tests/integration/test_access.py`, run as `takeoff-devops`): `takeoff-devops`
+  has exactly `SignInLocalDevelopmentAccess`, `Takeoff-devops-cdk` and `Takeoff-devops-scripts`
+  attached and no inline policies (this checks the administrator's manual step;
+  `Takeoff-devops-scripts` allows `iam:ListAttachedUserPolicies` and `iam:ListUserPolicies` on
+  its own user only). The IAM policy simulator denies `takeoff-devops` `iam:CreateUser`, `iam:AttachUserPolicy` and
   `iam:CreateRole`, and denies `Takeoff-cf-exec` creating a role without the boundary or
   with a non-`Takeoff-*` name.
 
@@ -234,12 +271,16 @@ In this order:
 
 - `just` lists the recipes; `just setup` runs cleanly; `npx cdk --version` prints the version
   in `package-lock.json`.
-- The CDK CLI accepts `aws login` credentials: `just deploy-access` and `just bootstrap` succeed
-  with the `takeoff-admin` profile. If they don't, upgrade `aws-cdk`, or have `deploy.py` pass
-  the credentials from `aws configure export-credentials --profile <profile> --format env`.
+- The CDK CLI accepts `aws login` credentials: `just deploy-access` succeeds with the
+  `takeoff-admin` profile. If it doesn't, upgrade `aws-cdk`, or have `deploy.py` pass the
+  credentials from `aws configure export-credentials --profile <profile> --format env`.
+- As `takeoff-admin`, `aws iam create-user --user-name takeoff-x` and
+  `aws iam attach-user-policy` (on any user) are denied.
 - `aws login --profile takeoff` succeeds, and `aws sts get-caller-identity --profile takeoff`
   shows account `303770518256` and the IAM user `takeoff-devops`.
-- The root user and `takeoff-admin` both have MFA; the root user has no access keys.
+- `takeoff-admin` and `takeoff-devops` both have MFA and no access keys. `takeoff-admin` has
+  only `SignInLocalDevelopmentAccess` and `TakeoffAppPlatform` attached (no `Takeoff-*`
+  policy).
 - As `takeoff-devops`, `aws iam list-users` is denied (it has no IAM admin rights).
 - `just check` runs cleanly (no stacks yet).
 - `npx cdk synth -c env=prod` (without the script) fails with the prod-confirmation error.
