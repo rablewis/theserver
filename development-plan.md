@@ -15,7 +15,7 @@ Decisions that must still be made, and the stage each one blocks, are listed in
 ## Assumptions
 
 - **PDF rendering:** Poppler `pdftocairo -svg` (P-2 option 1), called from the Python processing
-  Lambda, which runs as a container image. Stage 1 confirms or replaces this choice. P-2
+  Lambda, which runs as a container image. Stage 8 confirms or replaces this choice. P-2
   options 2 and 3 are Java and Rust, so choosing either would change AD-4 (Python for Lambda
   code) and Stages 9–10.
 - **Region:** `eu-west-2` (London) for every environment (NF-6, AD-15). Set in
@@ -127,15 +127,19 @@ attach it (AD-17).
 
 ## Stage 0: Project set-up and account bootstrap
 
+**Status: complete (2026-11-21).** All the Stage 0 manual / sanity checks pass.
+
 **Goal:** a working toolchain and an AWS account ready for CDK deployments (NF-3, NF-5).
 
-**Tools needed on the developer machine:** just, uv, Node.js (LTS), and AWS CLI v2 2.32.0 or
-later (for `aws login`).
+**Development environment (AD-21):** WSL with Debian 13 ("trixie") or later, with the
+repository cloned into the Linux filesystem. **Tools needed there:** just, uv, Node.js (LTS),
+and AWS CLI v2 2.32.0 or later (for `aws login`), with the `takeoff` and `takeoff-admin`
+profiles configured inside WSL. Stage 8 adds Poppler (`poppler-utils`).
 
 **Files**
 
-- `justfile` (AD-20): the project's commands. On Windows, recipes run in PowerShell
-  (`set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]`). Stage 0 recipes:
+- `justfile` (AD-20): the project's commands. Recipes run in `sh` in WSL (AD-21); for the
+  native Windows fallback they run in PowerShell (`set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]`). Stage 0 recipes:
 
   | Recipe | Runs |
   | --- | --- |
@@ -168,7 +172,7 @@ later (for `aws login`).
   [Deploying](#deploying)). Stacks are built by a function that the infra tests call directly,
   so the tests don't need this flag.
 - `scripts/dev/deploy.py`: `synth <env>` and `deploy <env>` run `npx cdk synth` /
-  `npx cdk deploy --all` (`npx.cmd` on Windows) for one environment with the `takeoff`
+  `npx cdk deploy --all` (`npx.cmd` in the native Windows fallback) for one environment with the `takeoff`
   profile, and stops if the profile's account isn't `303770518256`. `deploy prod` asks for
   typed confirmation first; `synth prod` doesn't (it deploys nothing). Both pass `-c prod_confirmed=yes` for prod.
   `access` deploys `infra/access_app.py` with the `takeoff-admin` profile, after the same typed
@@ -186,14 +190,14 @@ later (for `aws login`).
   - `Takeoff-cf-exec`: the CloudFormation execution policy. Services used by the stacks only,
     regional actions only in `eu-west-2` (plus DN-1's global services), `iam:CreateRole` only
     for `Takeoff-*` roles with the `Takeoff-boundary` boundary; denies changes to boundaries
-    and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 2 needs;
+    and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 1 needs;
     later stages add to it.
   - `Takeoff-boundary`: the permissions boundary for every role the CDK app creates.
   - `Takeoff-devops-cdk`: `sts:AssumeRole` on `cdk-hnb659fds-*` roles only.
   - `Takeoff-devops-scripts`: a scoped policy for scripts and tests (CloudFormation describe
     on `Takeoff-*`; later stages add Cognito test users, S3 on the Take-off buckets,
     CloudFront invalidation, `takeoff/*` secrets, Lambda invoke, SQS read, the IAM policy
-    simulator, Resource Groups Tagging read and starting the Power Tuning state machine).
+    simulator and starting the Power Tuning state machine). Stage 0.1 adds a region limit.
 - `infra/cdk.json`: runs the app with `uv run python app.py`, and sets
   `@aws-cdk/core:permissionsBoundary` to `Takeoff-boundary`.
 - `infra/takeoff_infra/config.py`: an `EnvConfig` dataclass per environment: account
@@ -281,44 +285,56 @@ In this order:
 - `takeoff-admin` and `takeoff-devops` both have MFA and no access keys. `takeoff-admin` has
   only `SignInLocalDevelopmentAccess` and `TakeoffAppPlatform` attached (no `Takeoff-*`
   policy).
-- As `takeoff-devops`, `aws iam list-users` is denied (it has no IAM admin rights).
+- As `takeoff-devops`, `aws iam list-users --profile takeoff` is denied (it has no IAM admin
+  rights).
 - `just check` runs cleanly (no stacks yet).
-- `npx cdk synth -c env=prod` (without the script) fails with the prod-confirmation error.
+- From `infra/` (where `cdk.json` is), `npx cdk synth -c env=prod` (without the script) fails
+  with the prod-confirmation error.
 
 ---
 
-## Stage 1: PDF-to-SVG rendering spike (local only)
+## Stage 0.1: Region limit on the scripts policy
 
-**Goal:** settle P-2 and answer the open question on average SVG size before the processing
-code is built. Nothing is deployed.
+**Goal:** scripts and tests run as `takeoff-devops` can't create or reach resources outside
+`eu-west-2` (NF-6, AD-15, AD-17). This comes before any stage adds permissions to
+`Takeoff-devops-scripts`.
 
 **Python files**
 
-- `scripts/dev/make_test_pdfs.py`: generates the fixtures in `tests/fixtures/pdfs/`: 1, 4, 20 and
-  21 pages, one close to 20 MB, a corrupt file, a non-PDF renamed `.pdf`, and a
-  password-protected PDF. Real sample drawings from the owner are added beside them.
-- `lambdas/processing/render.py`: `render_page(pdf_path, page, out_path)` that wraps
-  `pdftocairo -svg -f n -l n`, and `count_pages(pdf_path)`.
-- `scripts/dev/spike_render.py`: renders every fixture and prints time per page, SVG size per page,
-  and peak memory.
+- `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` ends with a statement that denies
+  every action when `aws:RequestedRegion` is not `eu-west-2` (`StringNotEquals`, on
+  `NotAction`), except a short, named list of global actions: IAM reads and the policy
+  simulator, CloudFront invalidation, STS, and the sign-in actions `aws login` uses. A deny
+  in any of the user's policies applies to all of them, so this also covers
+  `SignInLocalDevelopmentAccess` and `Takeoff-devops-cdk`.
 
-**AWS resources:** none.
+**AWS resources:** a new version of `Takeoff-devops-scripts`, deployed by `takeoff-admin` with
+`just deploy-access`. The policy name is unchanged, so the administrator has nothing to attach.
 
 **Automated tests**
 
-- Unit (`tests/unit/test_render.py`, needs Poppler installed or the container image): page
-  count is correct; each page gives a well-formed SVG; corrupt and non-PDF files raise a clear
-  `InvalidPdf` error.
+- Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` has the region deny; every
+  action it exempts is non-regional and either read-only or CloudFront invalidation; no
+  `Allow` statement names a region other than `eu-west-2` in a resource ARN.
+- Integration (`tests/integration/test_access.py`, run as `takeoff-devops`): with the context
+  key `aws:RequestedRegion` set to `us-east-1`, the IAM policy simulator denies
+  `takeoff-devops` a sample of the actions its scripts policy allows (for example
+  `s3:PutObject` and `s3:GetObject` on a Take-off bucket, `cloudformation:DescribeStacks`,
+  `lambda:InvokeFunction`, `secretsmanager:GetSecretValue`), and allows the same actions with
+  `eu-west-2`. Each later stage adds the new regional actions it gives the scripts policy to
+  this sample.
 
 **Manual / sanity checks**
 
-- Visually compare SVG output with the original PDFs for the real sample drawings.
-- Record the results (quality, time per page, average SVG size) in `decisions.md`, and move
-  P-2 to a confirmed decision or to the fallback.
+- `just login` still works, and `aws sts get-caller-identity --profile takeoff` still shows
+  `takeoff-devops`.
+- `aws cloudformation describe-stacks --profile takeoff --region us-east-1` is denied; the same
+  command with `--region eu-west-2` works.
+- `just check` and the Stage 0 integration tests still pass.
 
 ---
 
-## Stage 2: SPA hosting
+## Stage 1: SPA hosting
 
 **Goal:** HR-1, HR-2.
 
@@ -358,7 +374,7 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 3: Data bucket
+## Stage 2: Data bucket
 
 **Goal:** durable, encrypted, versioned storage (DA-1, NF-1, AD-3, AD-12).
 
@@ -396,7 +412,7 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 4: Authentication
+## Stage 3: Authentication
 
 **Goal:** AU-1 to AU-6 (AD-5).
 
@@ -444,7 +460,7 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 5: API skeleton with authentication
+## Stage 4: API skeleton with authentication
 
 **Goal:** an authenticated API in place before any data features (AP-3, AD-2).
 
@@ -484,7 +500,7 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 6: Projects
+## Stage 5: Projects
 
 **Goal:** DA-3, DA-5, DA-2, AD-6.
 
@@ -519,7 +535,7 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 7: JSON data files
+## Stage 6: JSON data files
 
 **Goal:** AP-1, AP-2, DA-4 (JSON files), AD-11.
 
@@ -547,12 +563,15 @@ code is built. Nothing is deployed.
 
 ---
 
-## Stage 8: PDF upload
+## Stage 7: PDF upload
 
 **Goal:** DA-4 (PDFs), DA-6 size limit, AD-8.
 
 **Python files**
 
+- `scripts/dev/make_test_pdfs.py`: generates the fixtures in `tests/fixtures/pdfs/`: 1, 4, 20 and
+  21 pages, one close to 20 MB, a corrupt file, a non-PDF renamed `.pdf`, and a
+  password-protected PDF. Real sample drawings from the owner are added beside them.
 - `lambdas/api/pdfs.py`: `POST /v1/projects/{id}/pdfs` issues a presigned POST for
   `pdf/{fileId}.pdf` with conditions: exact key, `Content-Type: application/pdf`,
   `content-length-range` up to 20 MB, `x-amz-meta-filename`. Refuses a third PDF (a project
@@ -575,6 +594,38 @@ code is built. Nothing is deployed.
 **Manual / sanity checks**
 
 - Upload a PDF from the browser on `localhost` against dev to confirm CORS for presigned POST.
+
+---
+
+## Stage 8: PDF-to-SVG rendering spike (local only)
+
+**Goal:** settle P-2 and answer the open question on average SVG size before the processing
+code is built. Nothing is deployed.
+
+**Tools needed:** Poppler, installed in WSL with `sudo apt install poppler-utils` (AD-21). Note
+its version (`pdftocairo -v`) with the results, because SVG output and speed can change
+between Poppler versions.
+
+**Python files**
+
+- `lambdas/processing/render.py`: `render_page(pdf_path, page, out_path)` that wraps
+  `pdftocairo -svg -f n -l n`, and `count_pages(pdf_path)`.
+- `scripts/dev/spike_render.py`: renders every fixture (generated in Stage 7) and prints
+  time per page, SVG size per page, and peak memory.
+
+**AWS resources:** none.
+
+**Automated tests**
+
+- Unit (`tests/unit/test_render.py`, needs Poppler installed or the container image): page
+  count is correct; each page gives a well-formed SVG; corrupt and non-PDF files raise a clear
+  `InvalidPdf` error.
+
+**Manual / sanity checks**
+
+- Visually compare SVG output with the original PDFs for the real sample drawings.
+- Record the results (quality, time per page, average SVG size) in `decisions.md`, and move
+  P-2 to a confirmed decision or to the fallback.
 
 ---
 
@@ -744,7 +795,7 @@ affecting each other (AD-14).
 
 **AWS resources**
 
-- Every stack from Stages 2–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
+- Every stack from Stages 1–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
   `scripts/dev/deploy.py` (prod asks for confirmation).
 - Identity-provider secrets and Google/Facebook redirect URLs for test and prod.
 - SES identity for prod emails (depends on the custom-domain decision); without it, Cognito's
@@ -756,9 +807,7 @@ affecting each other (AD-14).
 - Run the smoke suite against **prod**.
 - Run `test_environment_isolation.py`.
 - Run `tests/integration/test_residency.py` (all environments): every `Takeoff-*` stack is in
-  `eu-west-2`; the Resource Groups Tagging API finds no Take-off-tagged resources in any other
-  enabled region (except the global services allowed by DN-1); every log group, bucket,
-  queue and User Pool is in `eu-west-2`.
+  `eu-west-2`; every log group, bucket, queue and User Pool is in `eu-west-2`.
 - Infra: prod buckets and User Pool have `RETAIN` removal policies; prod has no test app client.
 
 **Manual / sanity checks**
@@ -777,17 +826,17 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 
 | # | Decision | Needed by | Current assumption / options | Notes |
 | --- | --- | --- | --- | --- |
-| DN-1 | **How NF-6 (UK residency) applies to AWS global services.** These hold configuration and public files, not user data: **CloudFront** (caches the SPA at edge locations worldwide), **IAM**, **AWS Budgets**, and, with a custom domain, **Route 53** and the **ACM certificates** that CloudFront and Cognito custom domains must have in **`us-east-1`** | Confirm before prod launch (Stage 13) | **Provisionally accepted**: listed as named exceptions in NF-6, because no user data passes through or is stored in them. | The alternative to CloudFront is serving the SPA from a UK-only service (for example API Gateway or a load balancer in front of the S3 bucket). That costs more, is slower for users, and is more work. A `us-east-1` certificate also needs CDK bootstrapped in `us-east-1`. If DN-1 is rejected, Stage 2 must be redesigned. |
-| DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 1 (before Stage 9) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
-| DN-4 | **Custom domain** for the SPA, API and sign-in pages | Stage 2 (can be added later, at the cost of reconfiguration) | CloudFront and Cognito default domains. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Needs certificates in `us-east-1` (DN-1). Changing it later means updating all of those in every environment. |
-| DN-5 | **ID format** for projects and files | Stage 3 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
-| DN-6 | **Sign-up and reset email sender** | Stage 4 (prod: Stage 13) | Cognito default sender in dev and test; Amazon SES in prod. | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
-| DN-7 | **Password policy and MFA** for email accounts | Stage 4 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
-| DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 4 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
-| DN-9 | **API throttling limits** (requests per second and burst) | Stage 5 | Around 50 rps steady, 100 burst per environment. | Expected peak is about 4 saves per second, plus polling and image requests. |
-| DN-10 | **Project name rules** and **maximum projects per user** | Stage 6 | 1–100 characters, any printable characters; no project limit. | A limit keeps `projects.json` small and fast to rewrite. |
-| DN-11 | **JSON data file names and schemas** | Stage 7 | Accept any JSON object up to 1 MB until schemas are supplied. | Must come from the front-end team. Without schemas the API checks only size and JSON syntax. |
-| DN-12 | **Average SVG size** (open question) | End of Stage 1 | Measured in Stage 1. | Decides SVG storage and download costs, and whether AD-13 browser caching is enough. |
+| DN-1 | **How NF-6 (UK residency) applies to AWS global services.** These hold configuration and public files, not user data: **CloudFront** (caches the SPA at edge locations worldwide), **IAM**, **AWS Budgets**, and, with a custom domain, **Route 53** and the **ACM certificates** that CloudFront and Cognito custom domains must have in **`us-east-1`** | Confirm before prod launch (Stage 13) | **Provisionally accepted**: listed as named exceptions in NF-6, because no user data passes through or is stored in them. | The alternative to CloudFront is serving the SPA from a UK-only service (for example API Gateway or a load balancer in front of the S3 bucket). That costs more, is slower for users, and is more work. A `us-east-1` certificate also needs CDK bootstrapped in `us-east-1`. If DN-1 is rejected, Stage 1 must be redesigned. |
+| DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 8 (before Stage 9) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
+| DN-4 | **Custom domain** for the SPA, API and sign-in pages | Stage 1 (can be added later, at the cost of reconfiguration) | CloudFront and Cognito default domains. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Needs certificates in `us-east-1` (DN-1). Changing it later means updating all of those in every environment. |
+| DN-5 | **ID format** for projects and files | Stage 2 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
+| DN-6 | **Sign-up and reset email sender** | Stage 3 (prod: Stage 13) | Cognito default sender in dev and test; Amazon SES in prod. | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
+| DN-7 | **Password policy and MFA** for email accounts | Stage 3 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
+| DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 3 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
+| DN-9 | **API throttling limits** (requests per second and burst) | Stage 4 | Around 50 rps steady, 100 burst per environment. | Expected peak is about 4 saves per second, plus polling and image requests. |
+| DN-10 | **Project name rules** and **maximum projects per user** | Stage 5 | 1–100 characters, any printable characters; no project limit. | A limit keeps `projects.json` small and fast to rewrite. |
+| DN-11 | **JSON data file names and schemas** | Stage 6 | Accept any JSON object up to 1 MB until schemas are supplied. | Must come from the front-end team. Without schemas the API checks only size and JSON syntax. |
+| DN-12 | **Average SVG size** (open question) | End of Stage 8 | Measured in Stage 8. | Decides SVG storage and download costs, and whether AD-13 browser caching is enough. |
 | DN-13 | **Lambda memory sizes** (P-4) | Stage 12 | 2 GB processing, 512 MB API, 256 MB failure handler. | Set from Power Tuning results. |
 | DN-14 | **Reserved concurrency** for dev and test | Stage 12 | e.g. 10 per Lambda in dev and test. | Protects prod in the shared account (AD-14). Too low a value makes integration tests slow or flaky. |
 | DN-15 | **Cost targets**, **budget alert amount** and **alarm recipients** | Stage 12 | None yet. | Cost targets are an open question in the requirements. |
