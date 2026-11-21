@@ -328,8 +328,10 @@ In this order:
 
 - `just login` still works, and `aws sts get-caller-identity --profile takeoff` still shows
   `takeoff-devops`.
-- `aws cloudformation describe-stacks --profile takeoff --region us-east-1` is denied; the same
-  command with `--region eu-west-2` works.
+- `aws cloudformation describe-stacks --stack-name CDKToolkit --profile takeoff --region us-east-1`
+  is denied with an explicit deny from `Takeoff-devops-scripts`; the same command with
+  `--region eu-west-2` returns the `CDKToolkit` stack. (Without `--stack-name` both are
+  denied, because the scripts policy only allows `DescribeStacks` on named stacks.)
 - `just check` and the Stage 0 integration tests still pass.
 
 ---
