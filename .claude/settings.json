@@ -1,0 +1,5 @@
+{
+    "permissions": {
+        "additionalDirectories": ["../take-off-backend"]
+    }
+}
