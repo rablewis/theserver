@@ -6,7 +6,7 @@ done. It implements [`high-level-requirements.md`](high-level-requirements.md) a
 decisions in [`architecture/decisions.md`](architecture/decisions.md).
 
 Each stage is deployed to **dev** and its tests pass there before the next stage starts.
-The **test** and **prod** environments are set up in Stage 13 (AD-14: all three live in one
+The **test** and **prod** environments are set up in Stage 14 (AD-14: all three live in one
 AWS account).
 
 Decisions that must still be made, and the stage each one blocks, are listed in
@@ -15,14 +15,14 @@ Decisions that must still be made, and the stage each one blocks, are listed in
 ## Assumptions
 
 - **PDF rendering:** Poppler `pdftocairo -svg` (P-2 option 1), called from the Python processing
-  Lambda, which runs as a container image. Stage 8 confirms or replaces this choice. P-2
+  Lambda, which runs as a container image. Stage 9 confirms or replaces this choice. P-2
   options 2 and 3 are Java and Rust, so choosing either would change AD-4 (Python for Lambda
-  code) and Stages 9–10.
+  code) and Stages 10–11.
 - **Region:** `eu-west-2` for every environment (NF-6, AD-15). Set in
   `infra/takeoff_infra/config.py` and checked by tests.
 - **AWS account:** `303770518256`, shared by dev, test and prod (AD-14). Set in
   `infra/takeoff_infra/config.py` and checked by tests.
-- **Domain:** until Stage 14, each environment uses its CloudFront default
+- **Domain:** until Stage 15, each environment uses its CloudFront default
   domain (`https://dxxxx.cloudfront.net`) and its Cognito managed-login prefix domain.
 - **Front end:** the SPA lives in another repository. This plan deploys a placeholder page
   and a script that uploads a real SPA build.
@@ -40,12 +40,12 @@ justfile                          # project commands (just): setup, check, deplo
 infra/
   app.py                          # CDK app: builds the stacks for one environment (-c env=dev|test|prod)
   access_app.py                   # CDK app for the account-wide Takeoff-access stack (takeoff-admin only)
-  domain_app.py                   # CDK app for the account-wide Takeoff-domain stack in us-east-1 (takeoff-admin only, Stage 14)
+  domain_app.py                   # CDK app for the account-wide Takeoff-domain stack in us-east-1 (takeoff-admin only, Stage 15)
   cdk.json
   takeoff_infra/
     config.py                     # per-environment settings
     access.py                     # IAM managed policies only: Takeoff-cf-exec, Takeoff-boundary, takeoff-devops's policies
-    domain.py                     # hosted zones, CAA records and us-east-1 certificates (Stage 14)
+    domain.py                     # hosted zones, CAA records and us-east-1 certificates (Stage 15)
     stacks/
       site.py                     # S3 site bucket + CloudFront
       data.py                     # S3 data bucket
@@ -93,7 +93,7 @@ Rules:
 - Tests sign in through a **test-only app client** with `ADMIN_USER_PASSWORD_AUTH`. That
   client exists in dev and test only.
 - `conftest.py` **refuses to run the integration suite with `--env prod`**. Prod has its own
-  non-destructive smoke tests (`tests/smoke/`, Stage 13).
+  non-destructive smoke tests (`tests/smoke/`, Stage 14).
 - **UK residency (NF-6)** is checked at every stage: an infra test fails if any stack is not
   pinned to `eu-west-2`, or if any template names another region (in an ARN, a replication
   rule or a cross-region reference), apart from the global services allowed by AD-22.
@@ -136,7 +136,7 @@ attach it (AD-17).
 **Development environment (AD-21):** WSL with Debian 13 ("trixie") or later, with the
 repository cloned into the Linux filesystem. **Tools needed there:** just, uv, Node.js (LTS),
 and AWS CLI v2 2.32.0 or later (for `aws login`), with the `takeoff` and `takeoff-admin`
-profiles configured inside WSL. Stage 8 adds Poppler (`poppler-utils`).
+profiles configured inside WSL. Stage 9 adds Poppler (`poppler-utils`).
 
 **Files**
 
@@ -192,7 +192,7 @@ profiles configured inside WSL. Stage 8 adds Poppler (`poppler-utils`).
   - `Takeoff-cf-exec`: the CloudFormation execution policy. Services used by the stacks only,
     regional actions only in `eu-west-2` (plus the global services AD-22 allows), `iam:CreateRole` only
     for `Takeoff-*` roles with the `Takeoff-boundary` boundary; denies changes to boundaries
-    and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 1 needs;
+    and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 2 needs;
     later stages add to it.
   - `Takeoff-boundary`: the permissions boundary for every role the CDK app creates.
   - `Takeoff-devops-cdk`: `sts:AssumeRole` on `cdk-hnb659fds-*` roles only.
@@ -341,9 +341,138 @@ pass.
 
 ---
 
-## Stage 1: SPA hosting
+## Stage 1: API skeleton
+
+**Goal:** a working, unauthenticated API (AD-2), so the API plumbing can be deployed and tested
+on its own before anything depends on it. It returns no user data and has no access to the
+data bucket until authentication is added in Stage 5.
+
+The later stages fill in what this stage can't have yet: Stage 2 adds CORS for the site origin
+and `apiUrl` in `config.json`, Stage 3 gives the Lambda access to the data bucket, and Stage 5
+adds the JWT authorizer.
+
+**Site stack switched off (done before this stage).** The SPA hosting code (Stage 2) is
+written, but AWS blocks CloudFront until the account is verified, and the first deploy of
+`Takeoff-dev-Site` failed and rolled back (it is left in `ROLLBACK_COMPLETE` with no
+resources; `stack_outputs.py` ignores it). `SITE_ENABLED = False` in
+`infra/takeoff_infra/config.py` (copied in `scripts/dev/upload_site.py`, with a unit test
+that keeps the two in step) means:
+
+- `build_stacks` leaves the Site stack out by default, so `just synth` and `just deploy` never
+  touch CloudFront;
+- `tests/helpers.py` still builds it (`include_site=True`), so its infra, guardrail and
+  resource coverage tests keep running in `just test`;
+- `tests/integration/test_site.py` is skipped, and `just upload-site` exits with a message.
+
+Stage 2 switches it back on.
+
+**Lambda packaging (AD-23).** The Lambda is a zip asset built by CDK *local bundling*
+with uv, with no Docker: the Lambda's packages are exported from `uv.lock` and installed for
+Linux arm64 (`uv pip install --target … --python-platform aarch64-manylinux_2_28
+--python-version 3.13 --only-binary :all:`), and the contents of `lambdas/` are copied next to
+them. boto3 is not bundled; the Lambda runtime provides it. The processing Lambda (Stage 10)
+is a container image and is packaged differently.
+
+**Python files**
+
+- `pyproject.toml`: a `lambda` dependency group (`aws-lambda-powertools`), included in
+  `[tool.uv] default-groups` so `uv sync` installs it for the unit tests; `lambdas` added to
+  pytest's `pythonpath` and `api` and `common` to ruff's `known-first-party` (inside the zip,
+  `lambdas/` is the root, so the code imports `api.…` and, from Stage 3, `common.…`).
+- `infra/takeoff_infra/bundling.py`: the local bundling (`ILocalBundling`) described above.
+  It fails the synth if uv is missing rather than falling back to Docker.
+- `infra/takeoff_infra/stacks/api.py`:
+  - an HTTP API with no authorizer and no CORS, and a single **`$default` route** that sends
+    every request to the Lambda, so unknown paths get the Lambda's 404 in the shared error
+    shape, not API Gateway's own `{"message":"Not Found"}`;
+  - the `$default` stage with throttling of **2 requests per second steady and 10 burst**
+    (AD-24) and access logging to an access log group;
+  - the API Lambda (Python 3.13, arm64, 512 MB, handler `api.handler.handler`, code from
+    `bundling.py`) with no data bucket access, and an explicit log group (so it is part of
+    the stack, not created by Lambda on first run);
+  - both log groups with the DN-16 default retention (30 days in dev and test, 1 year in
+    prod) and the environment's removal policy;
+  - outputs `ApiUrl` and `AccessLogGroupName`.
+- `infra/takeoff_infra/environment.py`: `build_stacks` adds the Api stack
+  (`Takeoff-<env>-Api`).
+- `infra/takeoff_infra/access.py`:
+  - `Takeoff-cf-exec`: `apigateway:*` on `arn:aws:apigateway:eu-west-2::/apis`,
+    `/apis/*` and `/tags/*`; and the actions API Gateway needs to turn on access logging,
+    which only work with `Resource: "*"`: `logs:CreateLogDelivery`, `logs:GetLogDelivery`,
+    `logs:UpdateLogDelivery`, `logs:DeleteLogDelivery`, `logs:ListLogDeliveries`,
+    `logs:PutResourcePolicy`, `logs:DescribeResourcePolicies` and `logs:DescribeLogGroups`
+    (all in `eu-west-2`). Lambda, log groups and `iam:PassRole` to Lambda are already
+    allowed.
+  - `Takeoff-devops-scripts`: `logs:FilterLogEvents` on the `Takeoff-*` API access log
+    groups (for the integration test) and `cloudformation:DescribeStackEvents` on
+    `Takeoff-*` stacks (to see why a deploy failed). The logs action is added to
+    `REGIONAL_ACTION_EXAMPLES` in `tests/integration/test_access.py`.
+- `lambdas/api/__init__.py`, `lambdas/api/handler.py`: entry point using AWS Lambda
+  Powertools' `APIGatewayHttpResolver`, with structured logging.
+- `lambdas/api/errors.py`: error responses in one consistent JSON shape, including the
+  resolver's not-found handler.
+- `lambdas/api/projects.py`: `GET /v1/projects`, which returns an empty list at this stage.
+- `tests/helpers.py`: builds the test app with the `aws:cdk:bundling-stacks` context set to
+  `[]`, so the infra tests don't run the bundling.
+- `tests/resource_coverage.py`: maps every Api stack resource (API, stage, route,
+  integration, Lambda permission, function, role, both log groups) to its test in
+  `tests/integration/test_api.py`.
+
+**AWS resources**
+
+In this order:
+
+1. `just check`.
+2. `takeoff-admin`: `just deploy-access`, which deploys new versions of `Takeoff-cf-exec` and
+   `Takeoff-devops-scripts` (names unchanged, so the administrator has nothing to attach).
+3. `takeoff-devops`: `just deploy dev` creates the API Gateway HTTP API, its `$default` route,
+   integration and stage, the access log group, the API Lambda, its execution role and log
+   group, and the permission that lets API Gateway invoke it.
+4. `just integration dev`.
+
+**Automated tests**
+
+- Infra (`tests/infra/test_api.py`): the function is Python 3.13, arm64, 512 MB; the only
+  route is `$default` and it integrates with the function; the stage throttles at 2 rps and
+  10 burst and has access logging on; both log groups have the expected retention per
+  environment; the Lambda role has no S3 access; there is no authorizer and no CORS yet.
+- Infra (`tests/infra/test_access.py`): the new `Takeoff-cf-exec` statements are limited to
+  `eu-west-2`; `Takeoff-devops-scripts` can filter only `Takeoff-*` log groups.
+- Unit (`tests/unit/test_bundling.py`): the bundling installs only the `lambda` group, for
+  `aarch64-manylinux_2_28`, Python 3.13 and binary packages only, and copies `lambdas/`.
+- Unit (`tests/unit/test_api_handler.py`): `GET /v1/projects` returns `{"projects": []}`; an
+  unknown route returns 404 in the shared error shape.
+- Integration (`tests/integration/test_api.py`), sending requests one at a time to stay
+  within the throttling limits:
+  - `GET /v1/projects` returns 200 and `{"projects": []}` (this also shows the bundled
+    packages import on Lambda).
+  - An unknown route returns 404 in the shared error shape.
+  - A request appears in the access log group (polled for up to a minute, because logs
+    arrive late).
+- Integration (`tests/integration/test_access.py`): `logs:FilterLogEvents` is allowed for
+  `takeoff-devops` in `eu-west-2` and denied in `us-east-1`.
+
+**Manual / sanity checks**
+
+- `curl $ApiUrl/v1/projects` returns `{"projects": []}`.
+
+---
+
+## Stage 2: SPA hosting
 
 **Goal:** HR-1, HR-2.
+
+**Status: code written (`take-off-backend` commit `732bed9`); deploying is blocked until AWS
+verifies the account and allows CloudFront.** The Site stack is switched off until then (see
+Stage 1). To start this stage:
+
+1. Set `SITE_ENABLED = True` in `infra/takeoff_infra/config.py` and
+   `scripts/dev/upload_site.py`, or remove the switch and its skip in
+   `tests/integration/test_site.py`.
+2. The empty `Takeoff-dev-Site` stack left in `ROLLBACK_COMPLETE` by the first attempt needs
+   no action: `cdk deploy` deletes it and creates the stack again.
+3. Add what the written code doesn't have yet: CORS on the API and `apiUrl` in
+   `config.json` (below).
 
 **Python files**
 
@@ -361,9 +490,14 @@ pass.
   (`Takeoff-<env>-Site`).
 - `scripts/dev/upload_site.py`: uploads a build folder (a SvelteKit build, or
   `site_placeholder/`) to the site bucket, with a long cache for hashed assets and no cache
-  for `index.html` and `config.json`; deletes files that are no longer in the build; writes
-  `config.json` with the settings that exist so far (in Stage 1 only `environment`, the environment name;
-  Stage 3 adds the Cognito details and Stage 4 the API URL); and invalidates CloudFront.
+  for `index.html` and `config.json`; deletes files that are no longer in the build, except
+  old files under `_app/immutable/` (a browser with the previous `index.html` still open may
+  load them, and they never change); writes
+  `config.json` with the settings that exist so far (in Stage 2 `environment`, the environment
+  name, and `apiUrl`, from the Api stack's `ApiUrl` output; Stage 4 adds the Cognito details);
+  and invalidates CloudFront.
+- `infra/takeoff_infra/stacks/api.py`: adds CORS on the HTTP API for the site origin (and
+  `http://localhost:5173` in dev only).
 - `justfile`: `just upload-site <env> <build dir>` runs `upload_site.py`.
 - `site_placeholder/index.html`: a placeholder page used until the real SPA is deployed.
 - `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` gets what `upload_site.py` needs:
@@ -387,7 +521,7 @@ In this order:
    attach.
 2. `takeoff-devops`: `just deploy dev` creates the S3 site bucket (`eu-west-2`), its bucket
    policy, the CloudFront distribution, the Origin Access Control, and (dev and test only) the
-   auto-delete custom resource with its Lambda and role.
+   auto-delete custom resource with its Lambda and role, and adds CORS to the HTTP API.
 3. `just upload-site dev site_placeholder` puts the placeholder page and `config.json` in the
    bucket.
 4. `just integration dev`.
@@ -407,8 +541,10 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 - Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` allows S3 writes only on the
   site buckets, and only the two CloudFront invalidation actions.
 - Unit (`tests/unit/test_upload_site.py`, with moto): hashed assets get a long cache;
-  `index.html` and `config.json` get no cache; `config.json` holds `environment` (the environment name);
-  files that are no longer in the build are deleted.
+  `index.html` and `config.json` get no cache; `config.json` holds `environment` (the
+  environment name) and `apiUrl` (from the Api stack's `ApiUrl` output);
+  files that are no longer in the build are deleted, apart from old files under
+  `_app/immutable/`, which are kept.
 - Integration (`tests/integration/test_access.py`): the new S3 actions are allowed for
   `takeoff-devops` in `eu-west-2` and denied in `us-east-1` (the Stage 0.1 region test, with
   the new `REGIONAL_ACTION_EXAMPLES` entries).
@@ -419,6 +555,9 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
   - `GET SiteUrl/config.json` returns 200, valid JSON and a no-cache `Cache-Control` header.
   - `http://` is redirected to `https://`.
   - A direct request to the bucket's S3 URL is denied (403).
+- Infra (`tests/infra/test_api.py`): the API's CORS origins differ by environment.
+- Integration (`tests/integration/test_api.py`): a CORS preflight from the site origin
+  succeeds; one from another origin gets no `Access-Control-Allow-Origin` header.
 
 **Manual / sanity checks**
 
@@ -426,7 +565,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 2: Data bucket
+## Stage 3: Data bucket
 
 **Goal:** durable, encrypted, versioned storage (DA-1, NF-1, AD-3, AD-12).
 
@@ -439,6 +578,8 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 - `lambdas/common/keys.py`: builders for every S3 key in `data-design.md` (`projects_json(sub)`,
   `pdf_key(sub, project_id, file_id)`, …), with checks on ID formats.
 - `lambdas/common/ids.py`: ULID generation and validation.
+- `infra/takeoff_infra/stacks/api.py`: gives the API Lambda IAM access only to `users/*` in
+  this environment's data bucket.
 
 **AWS resources**
 
@@ -448,7 +589,9 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 **Automated tests**
 
 - Infra: encryption, versioning, public access block, TLS-only policy, lifecycle rule (30 days
-  noncurrent), CORS origins differ by environment.
+  noncurrent), CORS origins differ by environment; the API Lambda role can reach only the
+  data bucket's `users/*` keys in this environment (no `*` resources, no other environment's
+  bucket).
 - Unit: key builders produce exactly the layout in `data-design.md` and reject IDs containing
   `/`, `..` or other unexpected characters.
 - Integration (`tests/integration/test_data_bucket.py`):
@@ -464,7 +607,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 3: Authentication
+## Stage 4: Authentication
 
 **Goal:** AU-1 to AU-6 (AD-5).
 
@@ -518,44 +661,33 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 4: API skeleton with authentication
+## Stage 5: API authentication
 
-**Goal:** an authenticated API in place before any data features (AP-3, AD-2).
+**Goal:** every API route requires a valid token from this environment's User Pool, and the
+caller's identity comes only from that token (AP-3).
 
 **Python files**
 
-- `infra/takeoff_infra/stacks/api.py`: HTTP API with a JWT authorizer on the User Pool (SPA
-  client audience, plus the test client in dev and test); CORS for the site origin; API Lambda
-  (arm64, 512 MB) with IAM access only to `users/*` in this environment's data bucket; access
-  logging; throttling limits. Output `ApiUrl`.
-- `lambdas/api/handler.py`: entry point using AWS Lambda Powertools'
-  `APIGatewayHttpResolver`, with structured logging.
+- `infra/takeoff_infra/stacks/api.py`: adds a JWT authorizer on the User Pool (SPA client
+  audience, plus the test client in dev and test) and makes it the default for every route.
 - `lambdas/api/auth.py`: `caller_sub(event)` reads `sub` **only** from the authorizer's JWT
   claims.
-- `lambdas/api/errors.py`: error responses in one consistent JSON shape.
-- `lambdas/api/projects.py`: `GET /v1/projects`, which returns an empty list at this stage.
-- `scripts/dev/upload_site.py`: adds `apiUrl` to `config.json`, from the Api stack's
-  `ApiUrl` output. Run `just upload-site <env> <build dir>` again after deploying, so the
-  site's `config.json` gets the new key.
+- `tests/integration/test_api.py`: the Stage 1 tests now send a `test_user` token.
 
 **AWS resources**
 
-- API Gateway HTTP API, JWT authorizer, `$default` stage, access log group, API Lambda, its
-  execution role and log group.
+- JWT authorizer on the existing HTTP API.
 
 **Automated tests**
 
-- Infra: every route has the JWT authorizer; the Lambda role can reach only the data bucket's
-  `users/*` keys in this environment (no `*` resources, no other environment's bucket).
+- Infra: every route has the JWT authorizer, with the right issuer and audiences per
+  environment (no test client audience in prod).
 - Unit: `caller_sub` uses the JWT claims and ignores any `sub` in headers, query or body.
-- Unit (`tests/unit/test_upload_site.py`): `config.json` gets `apiUrl` from the Api stack's
-  `ApiUrl` output.
 - Integration (`tests/integration/test_api_auth.py`):
   - No token returns 401; a malformed token returns 401; an expired token returns 401.
   - A token from another environment's User Pool returns 401.
   - A valid token returns 200 and `{"projects": []}`.
-  - A CORS preflight from the site origin succeeds; one from another origin gets no
-    `Access-Control-Allow-Origin` header.
+  - A CORS preflight from the site origin still succeeds without a token.
 
 **Manual / sanity checks**
 
@@ -563,7 +695,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 5: Projects
+## Stage 6: Projects
 
 **Goal:** DA-3, DA-5, DA-2, AD-6.
 
@@ -587,7 +719,8 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
   - Delete removes every object under the prefix.
 - Integration (`tests/integration/test_projects.py`):
   - Full lifecycle: create, list, rename, get, delete, list.
-  - 10 parallel creates for one user all appear in the list (conditional writes work).
+  - 10 parallel creates for one user all appear in the list (conditional writes work). This
+    uses the whole 10-request burst (AD-24), so the requests retry on 429 with backoff.
   - **Isolation (DA-2):** `second_test_user` gets 404 on `GET`, `PATCH` and `DELETE` of the first
     user's project, and the first user's list is unchanged.
   - Objects land under `users/{sub}/` for the caller's real `sub`.
@@ -598,7 +731,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 6: JSON data files
+## Stage 7: JSON data files
 
 **Goal:** AP-1, AP-2, DA-4 (JSON files), AD-11.
 
@@ -626,7 +759,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 7: PDF upload
+## Stage 8: PDF upload
 
 **Goal:** DA-4 (PDFs), DA-6 size limit, AD-8.
 
@@ -660,7 +793,7 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 ---
 
-## Stage 8: PDF-to-SVG rendering spike (local only)
+## Stage 9: PDF-to-SVG rendering spike (local only)
 
 **Goal:** settle P-2 and answer the open question on average SVG size before the processing
 code is built. Nothing is deployed.
@@ -673,7 +806,7 @@ between Poppler versions.
 
 - `lambdas/processing/render.py`: `render_page(pdf_path, page, out_path)` that wraps
   `pdftocairo -svg -f n -l n`, and `count_pages(pdf_path)`.
-- `scripts/dev/spike_render.py`: renders every fixture (generated in Stage 7) and prints
+- `scripts/dev/spike_render.py`: renders every fixture (generated in Stage 8) and prints
   time per page, SVG size per page, and peak memory.
 
 **AWS resources:** none.
@@ -692,7 +825,7 @@ between Poppler versions.
 
 ---
 
-## Stage 9: Image generation
+## Stage 10: Image generation
 
 **Goal:** DA-7, DA-6 page limit, NF-4, AD-7, P-4.
 
@@ -705,7 +838,7 @@ between Poppler versions.
   `status: processing`; checks page count (over 20 pages or invalid PDF → `failed`, delete
   the PDF); renders one page at a time; stops and cleans up when the 2-minute budget runs out;
   writes `status: ready` with `pages`. Unexpected errors (for example a missing object) are
-  **not** caught, so they reach the failure path in Stage 10.
+  **not** caught, so they reach the failure path in Stage 11.
 - `lambdas/common/status.py`: the `status.json` model and writer.
 - `infra/takeoff_infra/stacks/processing.py`: processing Lambda from the container image
   (arm64, 2 GB, 3-minute timeout, `retry_attempts=0`); S3 notification for keys ending in `.pdf`
@@ -736,7 +869,7 @@ between Poppler versions.
 
 ---
 
-## Stage 10: Processing failure handling
+## Stage 11: Processing failure handling
 
 **Goal:** a PDF never stays in `processing` (AD-10).
 
@@ -772,7 +905,7 @@ between Poppler versions.
 
 ---
 
-## Stage 11: Image download
+## Stage 12: Image download
 
 **Goal:** DA-8, AD-9.
 
@@ -799,7 +932,7 @@ between Poppler versions.
 
 ---
 
-## Stage 12: Monitoring, limits and tuning
+## Stage 13: Monitoring, limits and tuning
 
 **Goal:** know when something goes wrong, and keep the shared account's environments from
 affecting each other (AD-14).
@@ -811,6 +944,9 @@ affecting each other (AD-14).
   messages in the failure queue's DLQ; log retention on every log group (for example
   30 days in dev and test, 1 year in prod); reserved concurrency for dev and test Lambdas
   so they can't use up prod's capacity; an AWS Budgets alert.
+- `infra/takeoff_infra/stacks/api.py`: review the API throttling limits (AD-24) against the
+  expected prod load before prod opens to users, and set them per environment if prod
+  needs more.
 - `scripts/dev/power_tune.py`: runs AWS Lambda Power Tuning against the processing Lambda
   using the fixture PDFs, and prints the recommended memory size (P-4). The Power Tuning state
   machine is deployed by CDK in a dev-only stack, so its roles follow AD-17 (named
@@ -839,7 +975,7 @@ affecting each other (AD-14).
 
 ---
 
-## Stage 13: test and prod environments
+## Stage 14: test and prod environments
 
 **Goal:** NF-5: three separate environments.
 
@@ -854,15 +990,15 @@ affecting each other (AD-14).
 - `scripts/dev/smoke_test.py`: runs the right suite for an environment (integration for dev and
   test, smoke for prod).
 - `infra/takeoff_infra/config.py`: final settings for test and prod (retain policies, no test
-  client in prod). Custom domains and SES email come in Stage 14.
+  client in prod). Custom domains and SES email come in Stage 15.
 
 **AWS resources**
 
-- Every stack from Stages 1–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
+- Every stack from Stages 1–13 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
   `scripts/dev/deploy.py` (prod asks for confirmation).
 - Identity-provider secrets and Google/Facebook redirect URLs for test and prod.
-- No SES yet: until Stage 14, prod uses Cognito's default email sender, which has a low daily
-  limit. Don't open prod to users before Stage 14 is done.
+- No SES yet: until Stage 15, prod uses Cognito's default email sender, which has a low daily
+  limit. Don't open prod to users before Stage 15 is done.
 
 **Automated tests**
 
@@ -881,14 +1017,14 @@ affecting each other (AD-14).
 
 ---
 
-## Stage 14: Custom domain
+## Stage 15: Custom domain
 
 **Goal:** users reach the Take-off site and sign-in pages in prod through the project's own
 domain instead of the CloudFront and Cognito default domains (DN-4). The **test** environment
 uses the same pattern on a separate non-production domain, so every custom-domain setting is
 tried in test before prod. dev keeps the default domains.
 
-Open prod to users **after** this stage, not after Stage 13. The site's origin changes here,
+Open prod to users **after** this stage, not after Stage 14. The site's origin changes here,
 and browsers keep sign-in state and the SVG cache (AD-13) per origin, so users who started on
 the `cloudfront.net` domain would lose both and would have to update their bookmarks.
 
@@ -939,7 +1075,7 @@ What is deliberately left out, to keep the stage simple (AD-22):
   sign-in fails there, because Cognito's callback URLs and the API's CORS origins list only the
   custom domain.
 
-  **Possible later addition (after Stage 14):** a CloudFront Function on the distribution's
+  **Possible later addition (after Stage 15):** a CloudFront Function on the distribution's
   viewer requests could return a 301 from `www.<domain>` and from the `cloudfront.net` address
   to the SPA host, keeping the path and query string. It would be about 15 lines of
   JavaScript, deployed with the `Site` stack from `eu-west-2` (no `us-east-1` bootstrap, no
@@ -1069,23 +1205,22 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 
 | # | Decision | Needed by | Current assumption / options | Notes |
 | --- | --- | --- | --- | --- |
-| DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 8 (before Stage 9) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
-| DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 14 (register both before it starts) | Stages 1–13 use the CloudFront and Cognito default domains; Stage 14 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Prod should open to users only after Stage 14, because the site origin changes. |
-| DN-5 | **ID format** for projects and files | Stage 2 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
-| DN-6 | **Sign-up and reset email sender** | Stage 3 (prod and test: Stage 14) | Cognito default sender in dev; Amazon SES on the custom domains in test and prod (Stage 14). | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
-| DN-7 | **Password policy and MFA** for email accounts | Stage 3 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
-| DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 3 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
-| DN-9 | **API throttling limits** (requests per second and burst) | Stage 4 | Around 50 rps steady, 100 burst per environment. | Expected peak is about 4 saves per second, plus polling and image requests. |
-| DN-10 | **Project name rules** and **maximum projects per user** | Stage 5 | 1–100 characters, any printable characters; no project limit. | A limit keeps `projects.json` small and fast to rewrite. |
-| DN-11 | **JSON data file names and schemas** | Stage 6 | Accept any JSON object up to 1 MB until schemas are supplied. | Must come from the front-end team. Without schemas the API checks only size and JSON syntax. |
-| DN-12 | **Average SVG size** (open question) | End of Stage 8 | Measured in Stage 8. | Decides SVG storage and download costs, and whether AD-13 browser caching is enough. |
-| DN-13 | **Lambda memory sizes** (P-4) | Stage 12 | 2 GB processing, 512 MB API, 256 MB failure handler. | Set from Power Tuning results. |
-| DN-14 | **Reserved concurrency** for dev and test | Stage 12 | e.g. 10 per Lambda in dev and test. | Protects prod in the shared account (AD-14). Too low a value makes integration tests slow or flaky. |
-| DN-15 | **Cost targets**, **budget alert amount** and **alarm recipients** | Stage 12 | None yet. | Cost targets are an open question in the requirements. |
-| DN-16 | **Log retention** periods | Stage 12 | 30 days in dev and test, 1 year in prod. | May be driven by compliance needs (DN-18). |
-| DN-17 | **Availability targets, backup and retention** beyond 30-day S3 versioning | Stage 13 | S3 versioning only; no cross-region copy; no Cognito backup. | Cognito user pools can't be restored from a backup, so losing the prod pool means users must sign up again. `RETAIN` and deletion protection lower that risk. |
+| DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 9 (before Stage 10) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
+| DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 15 (register both before it starts) | Stages 1–14 use the CloudFront and Cognito default domains; Stage 15 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Prod should open to users only after Stage 15, because the site origin changes. |
+| DN-5 | **ID format** for projects and files | Stage 3 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
+| DN-6 | **Sign-up and reset email sender** | Stage 4 (prod and test: Stage 15) | Cognito default sender in dev; Amazon SES on the custom domains in test and prod (Stage 15). | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
+| DN-7 | **Password policy and MFA** for email accounts | Stage 4 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
+| DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 4 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
+| DN-10 | **Project name rules** and **maximum projects per user** | Stage 6 | 1–100 characters, any printable characters; no project limit. | A limit keeps `projects.json` small and fast to rewrite. |
+| DN-11 | **JSON data file names and schemas** | Stage 7 | Accept any JSON object up to 1 MB until schemas are supplied. | Must come from the front-end team. Without schemas the API checks only size and JSON syntax. |
+| DN-12 | **Average SVG size** (open question) | End of Stage 9 | Measured in Stage 9. | Decides SVG storage and download costs, and whether AD-13 browser caching is enough. |
+| DN-13 | **Lambda memory sizes** (P-4) | Stage 13 | 2 GB processing, 512 MB API, 256 MB failure handler. | Set from Power Tuning results. |
+| DN-14 | **Reserved concurrency** for dev and test | Stage 13 | e.g. 10 per Lambda in dev and test. | Protects prod in the shared account (AD-14). Too low a value makes integration tests slow or flaky. |
+| DN-15 | **Cost targets**, **budget alert amount** and **alarm recipients** | Stage 13 | None yet. | Cost targets are an open question in the requirements. |
+| DN-16 | **Log retention** periods | Stage 13 | 30 days in dev and test, 1 year in prod. | May be driven by compliance needs (DN-18). |
+| DN-17 | **Availability targets, backup and retention** beyond 30-day S3 versioning | Stage 14 | S3 versioning only; no cross-region copy; no Cognito backup. | Cognito user pools can't be restored from a backup, so losing the prod pool means users must sign up again. `RETAIN` and deletion protection lower that risk. |
 | DN-18 | **Compliance**: GDPR data export, account deletion, privacy notice | Before prod launch | Not built. | Account deletion would delete the Cognito user and everything under `users/{sub}/`. That's a new API route and stage. |
-| DN-19 | **Release process**: manual `cdk deploy` or a CI/CD pipeline, and how changes are promoted dev → test → prod | Stage 13 | Manual deploys from a developer machine. | A pipeline would run the infra and unit tests on every change and the integration suite before promotion. |
+| DN-19 | **Release process**: manual `cdk deploy` or a CI/CD pipeline, and how changes are promoted dev → test → prod | Stage 14 | Manual deploys from a developer machine. | A pipeline would run the infra and unit tests on every change and the integration suite before promotion. |
 
 ---
 
