@@ -18,11 +18,11 @@ Decisions that must still be made, and the stage each one blocks, are listed in
   Lambda, which runs as a container image. Stage 8 confirms or replaces this choice. P-2
   options 2 and 3 are Java and Rust, so choosing either would change AD-4 (Python for Lambda
   code) and Stages 9–10.
-- **Region:** `eu-west-2` (London) for every environment (NF-6, AD-15). Set in
+- **Region:** `eu-west-2` for every environment (NF-6, AD-15). Set in
   `infra/takeoff_infra/config.py` and checked by tests.
 - **AWS account:** `303770518256`, shared by dev, test and prod (AD-14). Set in
   `infra/takeoff_infra/config.py` and checked by tests.
-- **Domain:** until a custom domain is chosen, each environment uses its CloudFront default
+- **Domain:** until Stage 14, each environment uses its CloudFront default
   domain (`https://dxxxx.cloudfront.net`) and its Cognito managed-login prefix domain.
 - **Front end:** the SPA lives in another repository. This plan deploys a placeholder page
   and a script that uploads a real SPA build.
@@ -40,10 +40,12 @@ justfile                          # project commands (just): setup, check, deplo
 infra/
   app.py                          # CDK app: builds the stacks for one environment (-c env=dev|test|prod)
   access_app.py                   # CDK app for the account-wide Takeoff-access stack (takeoff-admin only)
+  domain_app.py                   # CDK app for the account-wide Takeoff-domain stack in us-east-1 (takeoff-admin only, Stage 14)
   cdk.json
   takeoff_infra/
     config.py                     # per-environment settings
     access.py                     # IAM managed policies only: Takeoff-cf-exec, Takeoff-boundary, takeoff-devops's policies
+    domain.py                     # hosted zones, CAA records and us-east-1 certificates (Stage 14)
     stacks/
       site.py                     # S3 site bucket + CloudFront
       data.py                     # S3 data bucket
@@ -94,7 +96,7 @@ Rules:
   non-destructive smoke tests (`tests/smoke/`, Stage 13).
 - **UK residency (NF-6)** is checked at every stage: an infra test fails if any stack is not
   pinned to `eu-west-2`, or if any template names another region (in an ARN, a replication
-  rule or a cross-region reference), apart from the global services allowed by DN-1.
+  rule or a cross-region reference), apart from the global services allowed by AD-22.
 - **Least privilege (AD-17)** is checked at every stage: an infra test fails if any IAM role in
   any `Takeoff-<env>-*` template lacks the `Takeoff-boundary` permissions boundary, or sets an
   explicit name that doesn't start with `Takeoff-` (roles without an explicit name get one
@@ -188,7 +190,7 @@ profiles configured inside WSL. Stage 8 adds Poppler (`poppler-utils`).
   policies attached, by hand by the administrator (AD-17), so the policy names must never
   change:
   - `Takeoff-cf-exec`: the CloudFormation execution policy. Services used by the stacks only,
-    regional actions only in `eu-west-2` (plus DN-1's global services), `iam:CreateRole` only
+    regional actions only in `eu-west-2` (plus the global services AD-22 allows), `iam:CreateRole` only
     for `Takeoff-*` roles with the `Takeoff-boundary` boundary; denies changes to boundaries
     and to the `Takeoff-*` access policies. Stage 0 starts it with what Stage 1 needs;
     later stages add to it.
@@ -295,6 +297,9 @@ In this order:
 
 ## Stage 0.1: Region limit on the scripts policy
 
+**Status: complete (2026-11-21).** All the Stage 0.1 automated tests and manual / sanity checks
+pass.
+
 **Goal:** scripts and tests run as `takeoff-devops` can't create or reach resources outside
 `eu-west-2` (NF-6, AD-15, AD-17). This comes before any stage adds permissions to
 `Takeoff-devops-scripts`.
@@ -342,31 +347,76 @@ In this order:
 
 **Python files**
 
-- `infra/takeoff_infra/stacks/site.py`: private, encrypted site bucket with all public access
-  blocked; CloudFront distribution with Origin Access Control, HTTPS only, and 403/404 mapped
-  to `/index.html` with status 200; outputs `SiteBucketName`, `DistributionId`, `SiteUrl`.
-- `scripts/dev/upload_site.py`: uploads a SvelteKit build folder to the site bucket (long cache
-  for hashed assets, no cache for `index.html`), writes `config.json` (API URL, Cognito
-  details from stack outputs), and invalidates CloudFront.
+- `infra/takeoff_infra/stacks/site.py`:
+  - a private, encrypted site bucket (`takeoff-<env>-site-<account>`) with all public access
+    blocked, and a bucket policy that denies non-TLS requests and allows reads only by the
+    distribution;
+  - `auto_delete_objects` in dev and test, so the stack can be destroyed while the bucket has
+    files in it (prod retains the bucket);
+  - a CloudFront distribution with Origin Access Control, HTTP redirected to HTTPS,
+    `index.html` as the default root object, and 403/404 mapped to `/index.html` with
+    status 200;
+  - outputs `SiteBucketName`, `DistributionId`, `SiteUrl`.
+- `infra/takeoff_infra/environment.py`: `build_stacks` adds the Site stack
+  (`Takeoff-<env>-Site`).
+- `scripts/dev/upload_site.py`: uploads a build folder (a SvelteKit build, or
+  `site_placeholder/`) to the site bucket, with a long cache for hashed assets and no cache
+  for `index.html` and `config.json`; deletes files that are no longer in the build; writes
+  `config.json` with the settings that exist so far (in Stage 1 only `environment`, the environment name;
+  Stage 3 adds the Cognito details and Stage 4 the API URL); and invalidates CloudFront.
+- `justfile`: `just upload-site <env> <build dir>` runs `upload_site.py`.
 - `site_placeholder/index.html`: a placeholder page used until the real SPA is deployed.
+- `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` gets what `upload_site.py` needs:
+  `s3:ListBucket` on the site buckets (`arn:aws:s3:::takeoff-*-site-*`), `s3:PutObject` and
+  `s3:DeleteObject` on their objects, and `cloudfront:CreateInvalidation` and
+  `cloudfront:GetInvalidation` on `arn:aws:cloudfront::303770518256:distribution/*`. The
+  CloudFront actions are already exempt from the region deny (Stage 0.1); the S3 actions are
+  added to `REGIONAL_ACTION_EXAMPLES` in `tests/integration/test_access.py`.
+- `tests/resource_coverage.py`: maps every Site stack resource (bucket, bucket policy,
+  distribution, Origin Access Control) to its test in `tests/integration/test_site.py`. The
+  auto-delete custom resource, its Lambda and its role map to the bucket's test.
+- `tests/infra/test_site.py`, `tests/unit/test_upload_site.py` and
+  `tests/integration/test_site.py`: the tests below.
 
 **AWS resources**
 
-- S3 site bucket (`eu-west-2`), CloudFront distribution, Origin Access Control, bucket policy
-  allowing only that distribution.
-- CloudFront is a global service: it caches the public SPA files at edge locations outside
-  the UK. It never handles user data, because API calls and file transfers go straight to
-  `eu-west-2`. NF-6 currently allows this as a provisional exception; DN-1 is still to be
-  confirmed.
+In this order:
+
+1. `takeoff-admin`: `just deploy-access`, which deploys a new version of
+   `Takeoff-devops-scripts`. The policy name is unchanged, so the administrator has nothing to
+   attach.
+2. `takeoff-devops`: `just deploy dev` creates the S3 site bucket (`eu-west-2`), its bucket
+   policy, the CloudFront distribution, the Origin Access Control, and (dev and test only) the
+   auto-delete custom resource with its Lambda and role.
+3. `just upload-site dev site_placeholder` puts the placeholder page and `config.json` in the
+   bucket.
+4. `just integration dev`.
+
+CloudFront is a global service: it serves and caches the public SPA files at edge locations,
+some outside the UK, which AD-22 allows. API calls and file transfers go straight to
+`eu-west-2`. The distribution has no CloudFront Functions or Lambda@Edge (no compute outside
+`eu-west-2`).
 
 **Automated tests**
 
-- Infra: bucket blocks public access and is encrypted; the distribution redirects HTTP to
-  HTTPS; error responses map to `/index.html`; the bucket policy allows only the
-  distribution's service principal.
+- Infra (`tests/infra/test_site.py`): the bucket blocks public access, is encrypted, and denies
+  non-TLS requests; its policy allows reads only by the distribution's service principal;
+  auto-delete is on in dev and test and off in prod, where the bucket is retained; the
+  distribution redirects HTTP to HTTPS, has `index.html` as its default root object, and maps
+  403 and 404 to `/index.html` with status 200.
+- Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` allows S3 writes only on the
+  site buckets, and only the two CloudFront invalidation actions.
+- Unit (`tests/unit/test_upload_site.py`, with moto): hashed assets get a long cache;
+  `index.html` and `config.json` get no cache; `config.json` holds `environment` (the environment name);
+  files that are no longer in the build are deleted.
+- Integration (`tests/integration/test_access.py`): the new S3 actions are allowed for
+  `takeoff-devops` in `eu-west-2` and denied in `us-east-1` (the Stage 0.1 region test, with
+  the new `REGIONAL_ACTION_EXAMPLES` entries).
 - Integration (`tests/integration/test_site.py`):
-  - `GET SiteUrl/` returns 200 and the placeholder HTML.
-  - `GET SiteUrl/some/deep/link` returns 200 and the same HTML (SPA fallback).
+  - `GET SiteUrl/` returns 200 with an HTML page. (The test checks the response, not the
+    placeholder's text, so it still passes once a real SPA build is uploaded.)
+  - `GET SiteUrl/some/deep/link` returns 200 and the same page (SPA fallback).
+  - `GET SiteUrl/config.json` returns 200, valid JSON and a no-cache `Cache-Control` header.
   - `http://` is redirected to `https://`.
   - A direct request to the bucket's S3 URL is denied (403).
 
@@ -426,6 +476,10 @@ In this order:
   secret, callback and sign-out URLs from the site URL, plus localhost in dev); a test-only
   app client with `ADMIN_USER_PASSWORD_AUTH` (dev and test only); no account linking.
   Outputs `UserPoolId`, `SpaClientId`, `TestClientId`, `LoginDomain`.
+- `scripts/dev/upload_site.py`: adds the sign-in settings to `config.json`, read from the Auth
+  stack's outputs: `region` (`eu-west-2`), `userPoolId`, `spaClientId` and `loginDomain`. It
+  never writes the test client's ID. Run `just upload-site <env> <build dir>` again after
+  deploying, so the site's `config.json` gets the new keys.
 - `scripts/ops/set_idp_secrets.py`: stores the Google and Facebook client ID and secret for an
   environment in Secrets Manager (`takeoff/<env>/google`, `takeoff/<env>/facebook`). Run
   once per environment before deploying.
@@ -444,6 +498,8 @@ In this order:
 - Infra: the SPA client has no secret and allows only the code grant; callback URLs are
   correct per environment; the test client exists only in dev and test; Google and Facebook
   providers are attached to the SPA client.
+- Unit (`tests/unit/test_upload_site.py`): `config.json` gets `region`, `userPoolId`,
+  `spaClientId` and `loginDomain` from the Auth stack's outputs, and no `TestClientId`.
 - Integration (`tests/integration/test_auth.py`):
   - The test fixture can create a user and get ID and access tokens.
   - Tokens verify against the pool's JWKS and contain `sub`.
@@ -478,6 +534,9 @@ In this order:
   claims.
 - `lambdas/api/errors.py`: error responses in one consistent JSON shape.
 - `lambdas/api/projects.py`: `GET /v1/projects`, which returns an empty list at this stage.
+- `scripts/dev/upload_site.py`: adds `apiUrl` to `config.json`, from the Api stack's
+  `ApiUrl` output. Run `just upload-site <env> <build dir>` again after deploying, so the
+  site's `config.json` gets the new key.
 
 **AWS resources**
 
@@ -489,6 +548,8 @@ In this order:
 - Infra: every route has the JWT authorizer; the Lambda role can reach only the data bucket's
   `users/*` keys in this environment (no `*` resources, no other environment's bucket).
 - Unit: `caller_sub` uses the JWT claims and ignores any `sub` in headers, query or body.
+- Unit (`tests/unit/test_upload_site.py`): `config.json` gets `apiUrl` from the Api stack's
+  `ApiUrl` output.
 - Integration (`tests/integration/test_api_auth.py`):
   - No token returns 401; a malformed token returns 401; an expired token returns 401.
   - A token from another environment's User Pool returns 401.
@@ -793,15 +854,15 @@ affecting each other (AD-14).
 - `scripts/dev/smoke_test.py`: runs the right suite for an environment (integration for dev and
   test, smoke for prod).
 - `infra/takeoff_infra/config.py`: final settings for test and prod (retain policies, no test
-  client in prod, Cognito email through SES for prod if a domain is available).
+  client in prod). Custom domains and SES email come in Stage 14.
 
 **AWS resources**
 
 - Every stack from Stages 1–12 deployed as `Takeoff-test-*` and `Takeoff-prod-*`, using
   `scripts/dev/deploy.py` (prod asks for confirmation).
 - Identity-provider secrets and Google/Facebook redirect URLs for test and prod.
-- SES identity for prod emails (depends on the custom-domain decision); without it, Cognito's
-  default email sender has a low daily limit.
+- No SES yet: until Stage 14, prod uses Cognito's default email sender, which has a low daily
+  limit. Don't open prod to users before Stage 14 is done.
 
 **Automated tests**
 
@@ -820,6 +881,186 @@ affecting each other (AD-14).
 
 ---
 
+## Stage 14: Custom domain
+
+**Goal:** users reach the Take-off site and sign-in pages in prod through the project's own
+domain instead of the CloudFront and Cognito default domains (DN-4). The **test** environment
+uses the same pattern on a separate non-production domain, so every custom-domain setting is
+tried in test before prod. dev keeps the default domains.
+
+Open prod to users **after** this stage, not after Stage 13. The site's origin changes here,
+and browsers keep sign-in state and the SVG cache (AD-13) per origin, so users who started on
+the `cloudfront.net` domain would lose both and would have to update their bookmarks.
+
+**Domain pattern**
+
+Two registrable domains, each in its own Route 53 hosted zone: the **prod domain** (written
+`<domain>` below) and a separate **non-production domain** (`<nonprod-domain>`, for example
+the prod name with a `-nonprod` suffix, under a cheap TLD).
+
+| Environment | SPA | Sign-in (Cognito managed login) | API |
+| --- | --- | --- | --- |
+| prod | `https://<domain>` | `https://auth.<domain>` | `execute-api` default URL |
+| test | `https://test.<nonprod-domain>` | `https://auth.test.<nonprod-domain>` | `execute-api` default URL |
+| dev | CloudFront default domain | Cognito prefix domain `takeoff-dev` | `execute-api` default URL |
+
+If `<domain>` already hosts another site (for example a company site), use `app.<domain>`
+for the SPA instead. `<domain>` must then still have an `A` record, because Cognito requires
+the parent of a custom domain to resolve.
+
+Why dev and test don't use subdomains of the prod domain:
+
+- **Cookies and same-site rules.** A page on `dev.<domain>` can set cookies for `<domain>`
+  that prod then reads (cookie tossing), and browsers treat all subdomains as the same site
+  for `SameSite` cookies. A separate registrable domain removes that path from a less-reviewed
+  dev or test build to prod.
+- **Allow-lists.** CORS origins, Cognito callback URLs and a future Content Security Policy are
+  exact host lists. With one domain, a suffix match such as `*.<domain>` would silently
+  include dev and test.
+- **Separate DNS.** Each hosted zone holds only one kind of environment, so a mistake in test's
+  DNS records can't change prod's. (`Takeoff-cf-exec` is shared by all environments (AD-16),
+  so IAM can't keep test out of the prod zone; the infra tests below check it instead.)
+- **Brand and search.** Test builds aren't published under the prod brand, and the non-prod
+  domain can be kept out of search engines as a whole (`robots.txt`).
+
+dev stays on the default domains: dev stacks are torn down and rebuilt often, and the default
+domains need no certificates or DNS. dev can be moved to `dev.<nonprod-domain>` later by
+setting its domain settings in `config.py`; no other code changes.
+
+What is deliberately left out, to keep the stage simple (AD-22):
+
+- **No API custom domain.** The SPA reads the API URL from `config.json`, so users never see
+  it, and CORS depends on the site's origin, not the API's. An `api.<domain>` host (a
+  regional API Gateway custom domain with an `eu-west-2` certificate) can be added later
+  without users noticing.
+- **No `www` host and no redirects at the edge.** Redirecting `www.<domain>` or the
+  `dxxxx.cloudfront.net` domain needs a CloudFront Function, which is code running at edge
+  locations (AD-22 allows none). The default `cloudfront.net` domain still serves the SPA, but
+  sign-in fails there, because Cognito's callback URLs and the API's CORS origins list only the
+  custom domain.
+
+  **Possible later addition (after Stage 14):** a CloudFront Function on the distribution's
+  viewer requests could return a 301 from `www.<domain>` and from the `cloudfront.net` address
+  to the SPA host, keeping the path and query string. It would be about 15 lines of
+  JavaScript, deployed with the `Site` stack from `eu-west-2` (no `us-east-1` bootstrap, no
+  IAM role, covered by the existing `cloudfront:*` permission), with no `console.log`, so it
+  writes no logs (function logs go to CloudWatch Logs in `us-east-1`). `www` would also need
+  adding to the prod certificate, the CloudFront aliases and DNS. AD-22 and NF-6 would first
+  have to allow redirect-only CloudFront Functions.
+
+How each host is served:
+
+- **SPA:** an alternate domain name on the existing CloudFront distribution, with an ACM
+  certificate in `us-east-1` (CloudFront accepts no other region) and the `TLSv1.2_2021`
+  security policy.
+- **Sign-in:** a Cognito managed-login custom domain with a certificate in `us-east-1`. Cognito
+  serves it through CloudFront, which AD-22 allows (access through edge locations; the User
+  Pool and its data stay in `eu-west-2`). Google and Facebook redirect to
+  `https://auth.<domain>/oauth2/idpresponse`.
+- **DNS:** alias `A` and `AAAA` records for each host. `CAA` records allow only Amazon
+  (`amazon.com`) to issue certificates for either domain.
+- **Email (DN-6):** an Amazon SES domain identity for `<domain>` in `eu-west-2`, with DKIM,
+  SPF and DMARC records, used as Cognito's sender (`no-reply@<domain>`) in prod. Test uses
+  `<nonprod-domain>` the same way, so the email set-up is tried before prod.
+
+**Where each resource is managed**
+
+- **Account-wide, rarely changed (new `Takeoff-domain` stack):** both hosted zones (`RETAIN`;
+  deleting a zone would take the site offline and lose its delegation), the `CAA` records, and
+  the `us-east-1` certificates (one per environment, covering its SPA and sign-in hosts,
+  validated by DNS). Certificates are configuration, not storage or compute, so AD-22 allows
+  them in `us-east-1`. Like `Takeoff-access`, the stack uses `LegacyStackSynthesizer` and is
+  deployed by `takeoff-admin` with its own credentials, so `us-east-1` needs **no CDK
+  bootstrap** (no CDK roles or asset bucket outside the UK), and `takeoff-devops` stays limited
+  to `eu-west-2`. The stack is in `us-east-1` because its certificates must be.
+- **Per environment (existing stacks, `eu-west-2`):** the CloudFront alternate domain (`Site`),
+  the Cognito custom domain and the SES identity (`Auth`), and each environment's DNS records.
+
+**Python files**
+
+- `infra/domain_app.py` and `infra/takeoff_infra/domain.py`: the `Takeoff-domain` stack, as
+  described above. Outputs the hosted zone IDs and each certificate's ARN.
+- `infra/takeoff_infra/config.py`: an optional `DomainConfig` per environment (hosted zone
+  name and ID, SPA and sign-in hosts, and the `us-east-1` certificate ARN, copied from the
+  `Takeoff-domain` outputs after its first deploy). Set for prod and test, `None` for dev.
+  With a domain set, the site origin used for CORS and Cognito callback URLs is the custom SPA
+  host only.
+- `infra/takeoff_infra/stacks/site.py` and `auth.py`: the per-environment resources above,
+  created only when the environment has a `DomainConfig`.
+- `infra/takeoff_infra/access.py`: `Takeoff-cf-exec` gets:
+  - `cognito-idp` user pool domain actions;
+  - `ses` identity actions (in `eu-west-2` only);
+  - `route53:ChangeResourceRecordSets` on the two hosted zones, limited to `A`, `AAAA`,
+    `CNAME` and `TXT` records (no `NS`, `SOA` or `CAA` changes, and no zone creation or
+    deletion), plus `route53:GetChange`, `route53:GetHostedZone` and
+    `route53:ListResourceRecordSets`.
+
+  Route 53 is a global service, so these are named exceptions, like CloudFront.
+  `Takeoff-devops-scripts` gets `ses:GetEmailIdentity` for the SES integration test.
+- `infra/policies/TakeoffAppPlatform.json`: the administrator adds the `Takeoff-domain` stack
+  in `us-east-1`, ACM certificate actions in `us-east-1` only, and Route 53 hosted zone
+  creation, reading, tagging and record changes. It gets no zone deletion and no domain
+  registration (`route53domains:*`).
+- `scripts/dev/deploy.py`: a `domain` command, run by `takeoff-admin` after the same typed
+  confirmation as `access`. Plus a `just deploy-domain` recipe.
+- `tests/integration/test_domain.py` and additions to `tests/smoke/test_prod_smoke.py`.
+
+**AWS resources**
+
+- **Administrator, by hand (before the first deploy):** register both domains, with Route 53
+  Domains or another registrar. Add the `Takeoff-domain` permissions to `TakeoffAppPlatform`.
+  If the registrar isn't Route 53, set the domains' name servers to the hosted zones' name
+  servers after step 1 below.
+- **In this order:**
+  1. `takeoff-admin`: `just deploy-access` (the new `Takeoff-cf-exec` permissions), then
+     `just deploy-domain`. CloudFormation waits until DNS validation issues the
+     certificates; this only finishes once the name servers point to the hosted zones.
+  2. Copy the zone IDs and certificate ARNs into `config.py`.
+  3. `just deploy test`, `just integration test`; then `just deploy prod`, `just smoke prod`.
+  4. Update the Google and Facebook apps (test and prod) with the new redirect URL and, for
+     Facebook, the app domain. Request SES production access for `eu-west-2`.
+- **Cost:** about $0.50 a month per hosted zone, plus each domain's yearly registration. ACM
+  public certificates are free.
+
+**Automated tests**
+
+- Infra:
+  - prod and test have a `DomainConfig` and dev has none;
+  - no host in test (or dev) is in the prod domain, and no prod host is in the non-prod
+    domain;
+  - CloudFront aliases match the configured SPA host, with the `us-east-1` certificate and
+    `TLSv1.2_2021`;
+  - no stack has a CloudFront Function or Lambda@Edge function (AD-22);
+  - Cognito callback and sign-out URLs and CORS origins list only the custom SPA host (plus
+    `localhost` in dev);
+  - the hosted zones are `RETAIN`;
+  - `Takeoff-cf-exec` can't change `NS`, `SOA` or `CAA` records or delete a zone.
+  - The UK-residency guardrail allows `us-east-1` only in ACM certificate ARNs, and only in the
+    `Takeoff-domain` stack and the CloudFront and Cognito domain settings that use them.
+- Integration (`tests/integration/test_domain.py`, against test) and smoke (prod):
+  - The SPA host returns 200 over HTTPS with a certificate valid for that host; `http://`
+    redirects to `https://`; a deep link returns the SPA.
+  - The sign-in host's managed login page returns 200, and
+    `/oauth2/authorize?identity_provider=Google…` redirects to Google with the custom
+    domain's `idpresponse` URL.
+  - A CORS preflight to the API from the custom SPA origin succeeds; one from the
+    `cloudfront.net` origin gets no `Access-Control-Allow-Origin` header.
+  - Every certificate is valid for more than 30 days (catches a renewal that is stuck because
+    a validation record was removed).
+  - The `CAA` records exist (`dnspython`, added as a dev dependency).
+  - The SES identity is verified with DKIM `SUCCESS`.
+  - `tests/integration/test_residency.py` accepts `Takeoff-domain` in `us-east-1`, and no
+    other stack outside `eu-west-2`.
+
+**Manual / sanity checks**
+
+- In a browser, on the prod domain: sign in with each method (email, Google, Facebook), open a
+  project, sign out.
+- A sign-up or password-reset email arrives from `no-reply@<domain>`, and its headers show DKIM,
+  SPF and DMARC passing.
+- An SSL Labs test of the SPA and sign-in hosts grades A or better.
+
+---
 ## Decisions still needed
 
 Each decision must be made before the stage shown. Where the plan already assumes an answer,
@@ -828,11 +1069,10 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 
 | # | Decision | Needed by | Current assumption / options | Notes |
 | --- | --- | --- | --- | --- |
-| DN-1 | **How NF-6 (UK residency) applies to AWS global services.** These hold configuration and public files, not user data: **CloudFront** (caches the SPA at edge locations worldwide), **IAM**, **AWS Budgets**, and, with a custom domain, **Route 53** and the **ACM certificates** that CloudFront and Cognito custom domains must have in **`us-east-1`** | Confirm before prod launch (Stage 13) | **Provisionally accepted**: listed as named exceptions in NF-6, because no user data passes through or is stored in them. | The alternative to CloudFront is serving the SPA from a UK-only service (for example API Gateway or a load balancer in front of the S3 bucket). That costs more, is slower for users, and is more work. A `us-east-1` certificate also needs CDK bootstrapped in `us-east-1`. If DN-1 is rejected, Stage 1 must be redesigned. |
 | DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 8 (before Stage 9) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
-| DN-4 | **Custom domain** for the SPA, API and sign-in pages | Stage 1 (can be added later, at the cost of reconfiguration) | CloudFront and Cognito default domains. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Needs certificates in `us-east-1` (DN-1). Changing it later means updating all of those in every environment. |
+| DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 14 (register both before it starts) | Stages 1–13 use the CloudFront and Cognito default domains; Stage 14 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Prod should open to users only after Stage 14, because the site origin changes. |
 | DN-5 | **ID format** for projects and files | Stage 2 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
-| DN-6 | **Sign-up and reset email sender** | Stage 3 (prod: Stage 13) | Cognito default sender in dev and test; Amazon SES in prod. | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
+| DN-6 | **Sign-up and reset email sender** | Stage 3 (prod and test: Stage 14) | Cognito default sender in dev; Amazon SES on the custom domains in test and prod (Stage 14). | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
 | DN-7 | **Password policy and MFA** for email accounts | Stage 3 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
 | DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 3 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
 | DN-9 | **API throttling limits** (requests per second and burst) | Stage 4 | Around 50 rps steady, 100 burst per environment. | Expected peak is about 4 saves per second, plus polling and image requests. |
@@ -852,5 +1092,5 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 ## Not covered by this plan
 
 - A CI/CD pipeline. Deployments are run with `scripts/dev/deploy.py` from a developer machine.
-- A custom domain, data-residency rules, GDPR export and account deletion, and backups
-  beyond S3 versioning. These depend on open questions in `high-level-requirements.md`.
+- Data-residency rules, GDPR export and account deletion, and backups beyond S3
+  versioning. These depend on open questions in `high-level-requirements.md`.
