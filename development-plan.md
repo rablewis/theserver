@@ -343,6 +343,9 @@ pass.
 
 ## Stage 1: API skeleton
 
+**Status: complete (2026-11-23).** Deployed to dev (`take-off-backend` commit `588724b`); all
+the Stage 1 automated tests and manual / sanity checks pass.
+
 **Goal:** a working, unauthenticated API (AD-2), so the API plumbing can be deployed and tested
 on its own before anything depends on it. It returns no user data until authentication is
 added in Stage 5, and has no data bucket access until Stage 3.
