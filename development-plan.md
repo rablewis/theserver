@@ -474,17 +474,10 @@ In this order:
 
 **Goal:** HR-1, HR-2.
 
-**Status: code written (`take-off-backend` commit `732bed9`); deploying is blocked until AWS
-verifies the account and allows CloudFront.** The Site stack is switched off until then (see
-Stage 1). To start this stage:
-
-1. Set `SITE_ENABLED = True` in `infra/takeoff_infra/config.py` and
-   `scripts/dev/upload_site.py`, or remove the switch and its skip in
-   `tests/integration/test_site.py`.
-2. The empty `Takeoff-dev-Site` stack left in `ROLLBACK_COMPLETE` by the first attempt needs
-   no action: `cdk deploy` deletes it and creates the stack again.
-3. Add what the written code doesn't have yet: CORS on the API and `apiUrl` in
-   `config.json` (below).
+**Status: complete (2026-11-23).** Deployed to dev (`take-off-backend` commits `732bed9`,
+`6e9b5f9` and `6c46c09`); all the Stage 2 automated tests and manual / sanity checks pass.
+The `SITE_ENABLED` switch described in Stage 1 has been removed: the Site stack is always
+built and deployed.
 
 **Python files**
 
