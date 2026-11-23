@@ -509,7 +509,10 @@ Stage 1). To start this stage:
   name, and `apiUrl`, from the Api stack's `ApiUrl` output; Stage 4 adds the Cognito details);
   and invalidates CloudFront.
 - `infra/takeoff_infra/stacks/api.py`: adds CORS on the HTTP API for the site origin (and
-  `http://localhost:5173` in dev only).
+  `http://localhost:5173` in dev only), and an `OPTIONS /{proxy+}` route to the same Lambda.
+  API Gateway answers preflights itself only when no route matches, so without this route
+  they would match `$default` and get the Lambda's 404. The Lambda returns an empty 204 for
+  any `OPTIONS` request, and API Gateway adds the CORS headers for allowed origins only.
 - `justfile`: `just upload-site <env> <build dir>` runs `upload_site.py`.
 - `site_placeholder/index.html`: a placeholder page used until the real SPA is deployed.
 - `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` gets what `upload_site.py` needs:
@@ -681,9 +684,9 @@ caller's identity comes only from that token (AP-3).
 **Python files**
 
 - `infra/takeoff_infra/stacks/api.py`: adds a JWT authorizer on the User Pool (SPA client
-  audience, plus the test client in dev and test) on the `$default` route, the API's only
-  route (Stage 1). Preflight requests still work without a token because API Gateway's
-  built-in CORS (Stage 2) answers them before the route is reached.
+  audience, plus the test client in dev and test) on the `$default` route (Stage 1). The
+  `OPTIONS /{proxy+}` preflight route (Stage 2) gets no authorizer, because browsers send
+  preflights without a token.
 - `lambdas/api/auth.py`: `caller_sub(event)` reads `sub` **only** from the authorizer's JWT
   claims.
 - `tests/integration/test_api.py`: the Stage 1 tests now send a `test_user` token.
@@ -694,8 +697,9 @@ caller's identity comes only from that token (AP-3).
 
 **Automated tests**
 
-- Infra: `$default` is still the only route and has the JWT authorizer, with the right
-  issuer and audiences per environment (no test client audience in prod).
+- Infra: the only routes are still `$default` and `OPTIONS /{proxy+}`; `$default` has the
+  JWT authorizer, with the right issuer and audiences per environment (no test client
+  audience in prod), and `OPTIONS /{proxy+}` has none.
 - Unit: `caller_sub` uses the JWT claims and ignores any `sub` in headers, query or body.
 - Integration (`tests/integration/test_api_auth.py`):
   - No token returns 401; a malformed token returns 401; an expired token returns 401.
@@ -722,7 +726,7 @@ caller's identity comes only from that token (AP-3).
   `GET /v1/projects/{id}` lists the folder and reads `status.json` files (empty at this stage).
 - `lambdas/api/validation.py`: project name rules (length, characters).
 
-**AWS resources:** Lambda routes added (API Gateway keeps its single `$default` route); no new resources.
+**AWS resources:** Lambda routes added (API Gateway keeps just its `$default` and preflight routes); no new resources.
 
 **Automated tests**
 
@@ -757,7 +761,7 @@ caller's identity comes only from that token (AP-3).
 - `lambdas/api/schemas/`: one JSON Schema per data file name. The schemas come from the
   front-end team; until then, the check is "valid JSON object".
 
-**AWS resources:** Lambda routes added (API Gateway keeps its single `$default` route).
+**AWS resources:** Lambda routes added (API Gateway keeps just its `$default` and preflight routes).
 
 **Automated tests**
 
