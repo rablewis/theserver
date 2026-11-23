@@ -344,8 +344,8 @@ pass.
 ## Stage 1: API skeleton
 
 **Goal:** a working, unauthenticated API (AD-2), so the API plumbing can be deployed and tested
-on its own before anything depends on it. It returns no user data and has no access to the
-data bucket until authentication is added in Stage 5.
+on its own before anything depends on it. It returns no user data until authentication is
+added in Stage 5, and has no data bucket access until Stage 3.
 
 The later stages fill in what this stage can't have yet: Stage 2 adds CORS for the site origin
 and `apiUrl` in `config.json`, Stage 3 gives the Lambda access to the data bucket, and Stage 5
@@ -380,7 +380,10 @@ is a container image and is packaged differently.
   pytest's `pythonpath` and `api` and `common` to ruff's `known-first-party` (inside the zip,
   `lambdas/` is the root, so the code imports `api.…` and, from Stage 3, `common.…`).
 - `infra/takeoff_infra/bundling.py`: the local bundling (`ILocalBundling`) described above.
-  It fails the synth if uv is missing rather than falling back to Docker.
+  It fails the synth if uv is missing rather than falling back to Docker. The asset uses a
+  custom hash computed from the contents of `lambdas/` and `uv.lock`, so a change to the
+  locked packages alone still deploys a new zip, and the hash can be checked without running
+  the bundling.
 - `infra/takeoff_infra/stacks/api.py`:
   - an HTTP API with no authorizer and no CORS, and a single **`$default` route** that sends
     every request to the Lambda, so unknown paths get the Lambda's 404 in the shared error
@@ -391,7 +394,10 @@ is a container image and is packaged differently.
     `bundling.py`) with no data bucket access, and an explicit log group (so it is part of
     the stack, not created by Lambda on first run);
   - both log groups with the DN-16 default retention (30 days in dev and test, 1 year in
-    prod) and the environment's removal policy;
+    prod) and the environment's removal policy. Neither log group sets a name, so
+    CloudFormation names them after the stack (`Takeoff-<env>-Api-…`), which is what the
+    `Takeoff-*` log-group permissions below expect; a name such as `/aws/lambda/…` or
+    `/aws/apigateway/…` would fall outside them;
   - outputs `ApiUrl` and `AccessLogGroupName`.
 - `infra/takeoff_infra/environment.py`: `build_stacks` adds the Api stack
   (`Takeoff-<env>-Api`).
@@ -405,7 +411,7 @@ is a container image and is packaged differently.
     allowed.
   - `Takeoff-devops-scripts`: `logs:FilterLogEvents` on the `Takeoff-*` API access log
     groups (for the integration test) and `cloudformation:DescribeStackEvents` on
-    `Takeoff-*` stacks (to see why a deploy failed). The logs action is added to
+    `Takeoff-*` stacks (to see why a deploy failed). Both actions are added to
     `REGIONAL_ACTION_EXAMPLES` in `tests/integration/test_access.py`.
 - `lambdas/api/__init__.py`, `lambdas/api/handler.py`: entry point using AWS Lambda
   Powertools' `APIGatewayHttpResolver`, with structured logging.
@@ -415,14 +421,14 @@ is a container image and is packaged differently.
 - `tests/helpers.py`: builds the test app with the `aws:cdk:bundling-stacks` context set to
   `[]`, so the infra tests don't run the bundling.
 - `tests/resource_coverage.py`: maps every Api stack resource (API, stage, route,
-  integration, Lambda permission, function, role, both log groups) to its test in
-  `tests/integration/test_api.py`.
+  integration, Lambda permission, function, role, the role's default policy if CDK adds one,
+  both log groups) to its test in `tests/integration/test_api.py`.
 
 **AWS resources**
 
 In this order:
 
-1. `just check`.
+1. `just setup` (installs the new `lambda` dependency group), then `just check`.
 2. `takeoff-admin`: `just deploy-access`, which deploys new versions of `Takeoff-cf-exec` and
    `Takeoff-devops-scripts` (names unchanged, so the administrator has nothing to attach).
 3. `takeoff-devops`: `just deploy dev` creates the API Gateway HTTP API, its `$default` route,
@@ -439,7 +445,9 @@ In this order:
 - Infra (`tests/infra/test_access.py`): the new `Takeoff-cf-exec` statements are limited to
   `eu-west-2`; `Takeoff-devops-scripts` can filter only `Takeoff-*` log groups.
 - Unit (`tests/unit/test_bundling.py`): the bundling installs only the `lambda` group, for
-  `aarch64-manylinux_2_28`, Python 3.13 and binary packages only, and copies `lambdas/`.
+  `aarch64-manylinux_2_28`, Python 3.13 and binary packages only, and copies `lambdas/`; the
+  custom asset hash changes when `uv.lock` or a file in `lambdas/` changes (computed
+  directly, without running the bundling).
 - Unit (`tests/unit/test_api_handler.py`): `GET /v1/projects` returns `{"projects": []}`; an
   unknown route returns 404 in the shared error shape.
 - Integration (`tests/integration/test_api.py`), sending requests one at a time to stay
@@ -449,8 +457,9 @@ In this order:
   - An unknown route returns 404 in the shared error shape.
   - A request appears in the access log group (polled for up to a minute, because logs
     arrive late).
-- Integration (`tests/integration/test_access.py`): `logs:FilterLogEvents` is allowed for
-  `takeoff-devops` in `eu-west-2` and denied in `us-east-1`.
+- Integration (`tests/integration/test_access.py`): `logs:FilterLogEvents` and
+  `cloudformation:DescribeStackEvents` are allowed for `takeoff-devops` in `eu-west-2` and
+  denied in `us-east-1`.
 
 **Manual / sanity checks**
 
@@ -669,7 +678,9 @@ caller's identity comes only from that token (AP-3).
 **Python files**
 
 - `infra/takeoff_infra/stacks/api.py`: adds a JWT authorizer on the User Pool (SPA client
-  audience, plus the test client in dev and test) and makes it the default for every route.
+  audience, plus the test client in dev and test) on the `$default` route, the API's only
+  route (Stage 1). Preflight requests still work without a token because API Gateway's
+  built-in CORS (Stage 2) answers them before the route is reached.
 - `lambdas/api/auth.py`: `caller_sub(event)` reads `sub` **only** from the authorizer's JWT
   claims.
 - `tests/integration/test_api.py`: the Stage 1 tests now send a `test_user` token.
@@ -680,8 +691,8 @@ caller's identity comes only from that token (AP-3).
 
 **Automated tests**
 
-- Infra: every route has the JWT authorizer, with the right issuer and audiences per
-  environment (no test client audience in prod).
+- Infra: `$default` is still the only route and has the JWT authorizer, with the right
+  issuer and audiences per environment (no test client audience in prod).
 - Unit: `caller_sub` uses the JWT claims and ignores any `sub` in headers, query or body.
 - Integration (`tests/integration/test_api_auth.py`):
   - No token returns 401; a malformed token returns 401; an expired token returns 401.
@@ -708,7 +719,7 @@ caller's identity comes only from that token (AP-3).
   `GET /v1/projects/{id}` lists the folder and reads `status.json` files (empty at this stage).
 - `lambdas/api/validation.py`: project name rules (length, characters).
 
-**AWS resources:** API routes added; no new resources.
+**AWS resources:** Lambda routes added (API Gateway keeps its single `$default` route); no new resources.
 
 **Automated tests**
 
@@ -743,7 +754,7 @@ caller's identity comes only from that token (AP-3).
 - `lambdas/api/schemas/`: one JSON Schema per data file name. The schemas come from the
   front-end team; until then, the check is "valid JSON object".
 
-**AWS resources:** API routes added.
+**AWS resources:** Lambda routes added (API Gateway keeps its single `$default` route).
 
 **Automated tests**
 
@@ -774,7 +785,7 @@ caller's identity comes only from that token (AP-3).
   holds at most 2).
 - `lambdas/api/projects.py`: `GET /v1/projects/{id}` now lists PDFs and their original file names.
 
-**AWS resources:** API route added; the API Lambda role gets `s3:PutObject` on `users/*/projects/*/pdf/*`.
+**AWS resources:** Lambda route added; the API Lambda role gets `s3:PutObject` on `users/*/projects/*/pdf/*`.
 
 **Automated tests**
 
@@ -915,7 +926,7 @@ between Poppler versions.
   URL valid for 5 minutes, after checking the project is in the caller's list and the
   image exists.
 
-**AWS resources:** API route added; the API Lambda role gets `s3:GetObject` on `users/*/projects/*/images/*`.
+**AWS resources:** Lambda route added; the API Lambda role gets `s3:GetObject` on `users/*/projects/*/images/*`.
 
 **Automated tests**
 
@@ -1217,7 +1228,7 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 | DN-13 | **Lambda memory sizes** (P-4) | Stage 13 | 2 GB processing, 512 MB API, 256 MB failure handler. | Set from Power Tuning results. |
 | DN-14 | **Reserved concurrency** for dev and test | Stage 13 | e.g. 10 per Lambda in dev and test. | Protects prod in the shared account (AD-14). Too low a value makes integration tests slow or flaky. |
 | DN-15 | **Cost targets**, **budget alert amount** and **alarm recipients** | Stage 13 | None yet. | Cost targets are an open question in the requirements. |
-| DN-16 | **Log retention** periods | Stage 13 | 30 days in dev and test, 1 year in prod. | May be driven by compliance needs (DN-18). |
+| DN-16 | **Log retention** periods | Stage 1 (review in Stage 13) | 30 days in dev and test, 1 year in prod; applied to the API log groups from Stage 1. | May be driven by compliance needs (DN-18). |
 | DN-17 | **Availability targets, backup and retention** beyond 30-day S3 versioning | Stage 14 | S3 versioning only; no cross-region copy; no Cognito backup. | Cognito user pools can't be restored from a backup, so losing the prod pool means users must sign up again. `RETAIN` and deletion protection lower that risk. |
 | DN-18 | **Compliance**: GDPR data export, account deletion, privacy notice | Before prod launch | Not built. | Account deletion would delete the Cognito user and everything under `users/{sub}/`. That's a new API route and stage. |
 | DN-19 | **Release process**: manual `cdk deploy` or a CI/CD pipeline, and how changes are promoted dev → test → prod | Stage 14 | Manual deploys from a developer machine. | A pipeline would run the infra and unit tests on every change and the integration suite before promotion. |
