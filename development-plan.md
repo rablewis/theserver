@@ -577,6 +577,9 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 **Goal:** durable, encrypted, versioned storage (DA-1, NF-1, AD-3, AD-12).
 
+**Status: complete (2026-11-24).** Deployed to dev (`take-off-backend` commit `40a8758`); all
+the Stage 3 automated tests and manual / sanity checks pass.
+
 **IDs:** project and file IDs are ULIDs generated with `python-ulid` (AD-25, which resolved
 DN-5).
 
