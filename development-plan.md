@@ -604,7 +604,11 @@ DN-5).
   before the Lambda that uses it is deployed.
 - `infra/takeoff_infra/stacks/api.py`: imports the bucket with
   `s3.Bucket.from_bucket_name(…, data_bucket_name(config))`, sets the Lambda environment
-  variable `DATA_BUCKET` to its name, and gives the Lambda role exactly:
+  variable `DATA_BUCKET` to its name, and adds policy statements to the Lambda role directly
+  with `function.add_to_role_policy(iam.PolicyStatement(…))`, not with the bucket's
+  `grant_*` helpers (`grant_read_write` and `grant_delete` add `s3:GetObject*`,
+  `s3:GetBucket*`, `s3:List*`, `s3:Abort*`, `s3:DeleteObject*` and more). The role gets
+  exactly:
   - `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on
     `arn:aws:s3:::takeoff-<env>-data-<account>/users/*`;
   - `s3:ListBucket` on `arn:aws:s3:::takeoff-<env>-data-<account>`, with the condition
@@ -618,7 +622,9 @@ DN-5).
   (see "Check from Stage 3" in Stage 6).
   Update the module docstring (it says the Lambda has no data bucket access).
 - `lambdas/common/__init__.py`, `lambdas/common/ids.py`: `new_id()` returns a new ULID
-  string; `is_valid_id(value)` accepts only 26-character Crockford base32 ULIDs (upper case).
+  string; `is_valid_id(value)` accepts only 26-character Crockford base32 ULIDs (upper case)
+  whose first character is `0`–`7` (the timestamp is 48 bits, so a higher first character
+  overflows it and `python-ulid` rejects it).
 - `lambdas/common/keys.py`: one builder for every S3 key in `data-design.md`:
   `user_prefix(sub)`, `projects_json(sub)`, `project_prefix(sub, project_id)`,
   `pdf_key(sub, project_id, file_id)`, `status_key(sub, project_id, file_id)`,
@@ -638,20 +644,34 @@ DN-5).
     `s3:GetLifecycleConfiguration`, `s3:GetBucketCORS`, `s3:GetBucketLocation`,
     `s3:GetReplicationConfiguration` and `s3:ListBucketVersions`;
   - on its objects: `s3:PutObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion`. The
-    versioning test writes and cleans up its own key, and from Stage 4 the test-user
+    plain-HTTP and versioning tests write their own keys and delete every version of them
+    afterwards, and from Stage 4 the test-user
     fixture deletes each test user's `users/{sub}/` data, every version included.
 
   The regional actions are added to `REGIONAL_ACTION_EXAMPLES` in
   `tests/integration/test_access.py`. `Takeoff-cf-exec` and `Takeoff-boundary` already allow
-  `s3:*` on `takeoff-*` buckets in `eu-west-2`, so they don't change.
-- `tests/resource_coverage.py`: a `Data` entry mapping the bucket, its policy and (dev and
-  test) the auto-delete custom resource to `tests/integration/test_data_bucket.py`. The
+  `s3:*` on `takeoff-*` buckets in `eu-west-2`, so they don't change. The `Takeoff-access`
+  template gains no new resource type, so the administrator doesn't change
+  `TakeoffAppPlatform` (`tests/infra/test_admin_policy.py` still passes).
+- `tests/resource_coverage.py`: a `Data` entry, each resource mapped to a test in
+  `tests/integration/test_data_bucket.py`:
+  - the bucket (`DataBucket/Resource`) to `test_writing_twice_keeps_two_versions`;
+  - its policy (`DataBucket/Policy/Resource`) to `test_plain_http_request_refused` (the
+    policy's TLS rule is what refuses it);
+  - in dev and test, the auto-delete helpers to the bucket's test, as in the Site stack: the
+    custom resource (`DataBucket/AutoDeleteObjectsCustomResource/Default`) and the
+    provider's role and Lambda (`Custom::S3AutoDeleteObjectsCustomResourceProvider/Role` and
+    `/Handler`). The provider is created once per stack, so the Data stack has its own.
+
+  The
   `Api` entry gains `ApiFunction/ServiceRole/DefaultPolicy/Resource` (the Lambda's new S3
   policy), mapped to `test_api.py::test_list_projects_returns_empty_list` for now: no route
   uses S3 until Stage 6. Stage 6 remaps it to a test that reads and writes `projects.json`.
 - `tests/infra/test_data.py`, `tests/unit/test_ids.py`, `tests/unit/test_keys.py`,
   `tests/integration/test_data_bucket.py`: the tests below. In `tests/infra/test_api.py`,
-  `test_lambda_role_has_no_s3_access` (Stage 1) is replaced by the S3 scope test below.
+  `test_lambda_role_has_no_s3_access` (Stage 1) is replaced by the S3 scope test below. In
+  `tests/infra/test_access.py`, `test_devops_scripts_writes_only_site_files_and_invalidations`
+  (Stage 2) is replaced by the two S3 tests below.
 
 **AWS resources**
 
@@ -681,11 +701,27 @@ In this order:
   `<this env's bucket>/users/*` and `s3:ListBucket` on this environment's bucket with the
   `users/*` prefix condition (no `*` resource, no other environment's bucket); the Api stack
   depends on the Data stack and imports no export from it.
-- Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` allows S3 writes only on
-  the site and data buckets, and the data bucket statements are limited to `eu-west-2`.
-- Unit (`tests/unit/test_ids.py`): `new_id()` gives valid ULIDs that sort in creation order;
-  `is_valid_id` rejects wrong lengths, lower case, characters outside Crockford base32,
-  `/`, `..` and the empty string.
+- Infra (`tests/infra/test_access.py`), replacing
+  `test_devops_scripts_writes_only_site_files_and_invalidations`:
+  - `test_devops_scripts_s3_only_on_site_and_data_buckets`: every S3 statement in
+    `Takeoff-devops-scripts` names only site resources (`arn:aws:s3:::takeoff-*-site-*`
+    and `/*`) or data resources (`arn:aws:s3:::takeoff-*-data-*` and `/*`), never both
+    and never anything else. Site statements allow only `s3:ListBucket`, `s3:PutObject` and
+    `s3:DeleteObject`. Data bucket statements allow only the bucket actions listed above
+    (`s3:GetBucketVersioning`, `s3:GetEncryptionConfiguration`,
+    `s3:GetBucketPublicAccessBlock`, `s3:GetLifecycleConfiguration`, `s3:GetBucketCORS`,
+    `s3:GetBucketLocation`, `s3:GetReplicationConfiguration`, `s3:ListBucketVersions`) on
+    the bucket ARN, and `s3:PutObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on
+    `/*`. Every S3 statement is limited to `eu-west-2`.
+  - `test_devops_scripts_cloudfront_only_invalidations`: CloudFront statements allow only
+    `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation`, on
+    `arn:aws:cloudfront::303770518256:distribution/*` (unchanged from the old test).
+- Unit (`tests/unit/test_ids.py`):
+  - `new_id()` gives valid ULIDs that sort in creation order. The test sleeps 2 ms between
+    calls (`time.sleep(0.002)`), so each ULID has a different millisecond timestamp:
+    `python-ulid` IDs made in the same millisecond are in random order.
+  - `is_valid_id` rejects wrong lengths, lower case, a first character above `7`, characters
+    outside Crockford base32, `/`, `..` and the empty string.
 - Unit (`tests/unit/test_keys.py`): each builder produces exactly the key in
   `data-design.md`; each rejects a `sub`, ID, page number or data name that breaks its rule,
   including values containing `/`, `..`, whitespace or `%`.
@@ -696,21 +732,29 @@ In this order:
   `DataBucketName` output:
   - `get_bucket_versioning`, `get_bucket_encryption`, `get_public_access_block`,
     `get_bucket_lifecycle_configuration` and `get_bucket_cors` match the design.
-  - A `PutObject` over plain HTTP (an S3 client with `use_ssl=False`) is refused with 403,
-    and the same request over HTTPS succeeds, so the refusal comes from the TLS rule, not a
-    missing permission.
-  - Writing an object twice keeps two versions (`list_object_versions`). The test uses its
-    own key outside `users/` (`integration-tests/<uuid>.txt`) and deletes every version
-    afterwards.
+  - `test_plain_http_request_refused`: a `PutObject` over plain HTTP (an S3 client with
+    `use_ssl=False`) is refused with 403, and the same request over HTTPS succeeds, so the
+    refusal comes from the TLS rule, not a missing permission. The test uses its own key
+    (`integration-tests/<uuid>.txt`) and, in a `finally` block, deletes every version of it
+    (`list_object_versions` then `delete_object` with each `VersionId`), so nothing is left
+    even if an assertion fails.
+  - `test_writing_twice_keeps_two_versions`: writing an object twice keeps two versions
+    (`list_object_versions`). The test uses its own key outside `users/`
+    (`integration-tests/<uuid>.txt`) and, in a `finally` block, deletes every version of it
+    (`list_object_versions` then `delete_object` with each `VersionId`), so nothing is left
+    even if an assertion fails.
   - `get_bucket_location` is `eu-west-2`, and `get_bucket_replication` fails with
     `ReplicationConfigurationNotFoundError` (NF-6).
 
 **Manual / sanity checks**
 
-- The bucket in the S3 console shows "Bucket and objects not public".
-- `aws lambda get-function-configuration` for the API Lambda shows `DATA_BUCKET`.
-- `curl $ApiUrl/v1/projects` still returns `{"projects": []}`: the new `common` package
-  and `python-ulid` are bundled without breaking the Lambda.
+- **Administrator:** in the S3 console, the data bucket shows "Bucket and objects not
+  public". (`takeoff-devops` can't do this: the console needs `s3:ListAllMyBuckets`,
+  `s3:GetBucketPolicyStatus` and other permissions it doesn't have.)
+- `curl $ApiUrl/v1/projects` still returns `{"projects": []}`: the API still works after
+  the Lambda's bundle and role changed. Nothing in `lambdas/api/` imports `common` or
+  `ulid` yet, so this doesn't show they load on Lambda; Stage 6 is the first stage that
+  runs them there.
 
 ---
 
