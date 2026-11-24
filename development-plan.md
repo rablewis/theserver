@@ -577,41 +577,140 @@ some outside the UK, which AD-22 allows. API calls and file transfers go straigh
 
 **Goal:** durable, encrypted, versioned storage (DA-1, NF-1, AD-3, AD-12).
 
+**IDs:** project and file IDs are ULIDs generated with `python-ulid` (AD-25, which resolved
+DN-5).
+
 **Python files**
 
-- `infra/takeoff_infra/stacks/data.py`: data bucket with SSE-S3 encryption, versioning, all
-  public access blocked, a bucket policy that denies non-TLS requests, a lifecycle rule
-  removing noncurrent versions after 30 days, and CORS allowing the site origin (and
-  `http://localhost:5173` in dev only) for presigned POST and GET.
-- `lambdas/common/keys.py`: builders for every S3 key in `data-design.md` (`projects_json(sub)`,
-  `pdf_key(sub, project_id, file_id)`, …), with checks on ID formats.
-- `lambdas/common/ids.py`: ULID generation and validation.
-- `infra/takeoff_infra/stacks/api.py`: gives the API Lambda IAM access only to `users/*` in
-  this environment's data bucket.
+- `infra/takeoff_infra/stacks/data.py`: the `Takeoff-<env>-Data` stack.
+  - `data_bucket_name(config)` returns `takeoff-<env>-data-<account>`. `api.py` uses it too,
+    so the Api stack refers to the bucket by name, with no CloudFormation export between
+    the Data and Api stacks.
+  - The data bucket: SSE-S3 encryption, versioning, all public access blocked,
+    `BUCKET_OWNER_ENFORCED` object ownership (ACLs off), and a bucket policy that denies
+    non-TLS requests (`enforce_ssl`). It has the environment's removal policy, and
+    `auto_delete_objects` in dev and test (it deletes every object version, so the stack can
+    be destroyed while the bucket has files in it). Prod retains the bucket.
+  - One lifecycle rule on the whole bucket (AD-12): noncurrent versions expire 30 days after
+    they are replaced or deleted. Delete markers whose versions have all expired are removed
+    (`expired_object_delete_marker`), so a deleted project leaves nothing behind. Incomplete
+    multipart uploads are aborted after 1 day.
+  - CORS for presigned POST and GET: origins are the site origin (from the Site stack, as for
+    the API in Stage 2) plus the environment's `cors_origins` (`http://localhost:5173` in dev
+    only); methods `GET` and `POST`; headers `*`; max age 1 hour.
+  - Output `DataBucketName`.
+- `infra/takeoff_infra/environment.py`: `build_stacks` adds the Data stack after Site (it
+  takes the site origin) and before Api, and makes Api depend on Data, so the bucket exists
+  before the Lambda that uses it is deployed.
+- `infra/takeoff_infra/stacks/api.py`: imports the bucket with
+  `s3.Bucket.from_bucket_name(…, data_bucket_name(config))`, sets the Lambda environment
+  variable `DATA_BUCKET` to its name, and gives the Lambda role exactly:
+  - `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on
+    `arn:aws:s3:::takeoff-<env>-data-<account>/users/*`;
+  - `s3:ListBucket` on `arn:aws:s3:::takeoff-<env>-data-<account>`, with the condition
+    `StringLike s3:prefix users/*`.
+
+  `ListBucket` is a bucket-level action, so it can't be limited to `users/*` by resource;
+  the condition does that. Stage 6 needs it to list a project folder, and S3 only returns
+  `NoSuchKey` (not 403) for a missing `projects.json` when the caller may list the bucket.
+  Stage 6's integration tests confirm that a new user's `GET /v1/projects` gets an empty
+  list; if the prefix condition stops S3 returning `NoSuchKey`, Stage 6 drops the condition
+  (see "Check from Stage 3" in Stage 6).
+  Update the module docstring (it says the Lambda has no data bucket access).
+- `lambdas/common/__init__.py`, `lambdas/common/ids.py`: `new_id()` returns a new ULID
+  string; `is_valid_id(value)` accepts only 26-character Crockford base32 ULIDs (upper case).
+- `lambdas/common/keys.py`: one builder for every S3 key in `data-design.md`:
+  `user_prefix(sub)`, `projects_json(sub)`, `project_prefix(sub, project_id)`,
+  `pdf_key(sub, project_id, file_id)`, `status_key(sub, project_id, file_id)`,
+  `image_key(sub, project_id, file_id, page)` and `data_key(sub, project_id, name)`. Each
+  one checks its arguments and raises `ValueError` for anything else:
+  - `sub`: a lower-case UUID (Cognito's format);
+  - `project_id`, `file_id`: valid ULIDs (`ids.is_valid_id`);
+  - `page`: an integer from 1 to 20 (DA-6);
+  - `name`: 1–64 characters of `a-z`, `0-9` and `-` (without `.json`, which the builder
+    adds). DN-11 may change this rule in Stage 7.
+- `pyproject.toml`: `python-ulid` added to the `lambda` dependency group (so it is bundled
+  with the Lambda), and `uv.lock` updated.
+- `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` gets, on the data buckets
+  (`arn:aws:s3:::takeoff-*-data-*`, a new `DATA_BUCKETS` constant like `SITE_BUCKETS`):
+  - on the bucket, for the integration tests' checks: `s3:GetBucketVersioning`,
+    `s3:GetEncryptionConfiguration`, `s3:GetBucketPublicAccessBlock`,
+    `s3:GetLifecycleConfiguration`, `s3:GetBucketCORS`, `s3:GetBucketLocation`,
+    `s3:GetReplicationConfiguration` and `s3:ListBucketVersions`;
+  - on its objects: `s3:PutObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion`. The
+    versioning test writes and cleans up its own key, and from Stage 4 the test-user
+    fixture deletes each test user's `users/{sub}/` data, every version included.
+
+  The regional actions are added to `REGIONAL_ACTION_EXAMPLES` in
+  `tests/integration/test_access.py`. `Takeoff-cf-exec` and `Takeoff-boundary` already allow
+  `s3:*` on `takeoff-*` buckets in `eu-west-2`, so they don't change.
+- `tests/resource_coverage.py`: a `Data` entry mapping the bucket, its policy and (dev and
+  test) the auto-delete custom resource to `tests/integration/test_data_bucket.py`. The
+  `Api` entry gains `ApiFunction/ServiceRole/DefaultPolicy/Resource` (the Lambda's new S3
+  policy), mapped to `test_api.py::test_list_projects_returns_empty_list` for now: no route
+  uses S3 until Stage 6. Stage 6 remaps it to a test that reads and writes `projects.json`.
+- `tests/infra/test_data.py`, `tests/unit/test_ids.py`, `tests/unit/test_keys.py`,
+  `tests/integration/test_data_bucket.py`: the tests below. In `tests/infra/test_api.py`,
+  `test_lambda_role_has_no_s3_access` (Stage 1) is replaced by the S3 scope test below.
 
 **AWS resources**
 
-- S3 data bucket (`takeoff-<env>-data-<account>`) with its bucket policy, lifecycle rule and
-  CORS rules.
+In this order:
+
+1. `just setup` (installs `python-ulid`), then `just check`.
+2. `takeoff-admin`: `just deploy-access`, which deploys a new version of
+   `Takeoff-devops-scripts`. The policy name is unchanged, so the administrator has nothing to
+   attach.
+3. `takeoff-devops`: `just deploy dev` creates the `Takeoff-dev-Data` stack: the S3 data
+   bucket (`takeoff-dev-data-303770518256`, `eu-west-2`) with its bucket policy, lifecycle
+   rule and CORS rules, and the auto-delete custom resource. It then updates the API Lambda's
+   role policy and environment.
+4. `just integration dev`.
 
 **Automated tests**
 
-- Infra: encryption, versioning, public access block, TLS-only policy, lifecycle rule (30 days
-  noncurrent), CORS origins differ by environment; the API Lambda role can reach only the
-  data bucket's `users/*` keys in this environment (no `*` resources, no other environment's
-  bucket).
-- Unit: key builders produce exactly the layout in `data-design.md` and reject IDs containing
-  `/`, `..` or other unexpected characters.
-- Integration (`tests/integration/test_data_bucket.py`):
-  - `get_bucket_versioning`, `get_bucket_encryption`, `get_public_access_block` and
-    `get_bucket_lifecycle_configuration` match the design.
-  - A request over plain HTTP is refused.
-  - Writing an object twice keeps two versions.
-  - `get_bucket_location` is `eu-west-2` and the bucket has no replication configuration (NF-6).
+- Infra (`tests/infra/test_data.py`): the bucket is named `takeoff-<env>-data-<account>`; it
+  is SSE-S3 encrypted and versioned, blocks all public access, has ACLs off, and its policy
+  denies requests without TLS; the lifecycle rule expires noncurrent versions after 30 days,
+  removes expired delete markers and aborts incomplete multipart uploads after 1 day; CORS
+  allows only `GET` and `POST`, from the site origin in every environment and
+  `http://localhost:5173` in dev only; auto-delete is on in dev and test and off in prod,
+  where the bucket is retained; the stack outputs `DataBucketName`.
+- Infra (`tests/infra/test_api.py`): the Lambda has `DATA_BUCKET` set to this environment's
+  bucket name; its role's only S3 permissions are the object actions on
+  `<this env's bucket>/users/*` and `s3:ListBucket` on this environment's bucket with the
+  `users/*` prefix condition (no `*` resource, no other environment's bucket); the Api stack
+  depends on the Data stack and imports no export from it.
+- Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` allows S3 writes only on
+  the site and data buckets, and the data bucket statements are limited to `eu-west-2`.
+- Unit (`tests/unit/test_ids.py`): `new_id()` gives valid ULIDs that sort in creation order;
+  `is_valid_id` rejects wrong lengths, lower case, characters outside Crockford base32,
+  `/`, `..` and the empty string.
+- Unit (`tests/unit/test_keys.py`): each builder produces exactly the key in
+  `data-design.md`; each rejects a `sub`, ID, page number or data name that breaks its rule,
+  including values containing `/`, `..`, whitespace or `%`.
+- Integration (`tests/integration/test_access.py`): the new S3 actions are allowed for
+  `takeoff-devops` in `eu-west-2` and denied in `us-east-1` (the new
+  `REGIONAL_ACTION_EXAMPLES` entries).
+- Integration (`tests/integration/test_data_bucket.py`), with the bucket name from the
+  `DataBucketName` output:
+  - `get_bucket_versioning`, `get_bucket_encryption`, `get_public_access_block`,
+    `get_bucket_lifecycle_configuration` and `get_bucket_cors` match the design.
+  - A `PutObject` over plain HTTP (an S3 client with `use_ssl=False`) is refused with 403,
+    and the same request over HTTPS succeeds, so the refusal comes from the TLS rule, not a
+    missing permission.
+  - Writing an object twice keeps two versions (`list_object_versions`). The test uses its
+    own key outside `users/` (`integration-tests/<uuid>.txt`) and deletes every version
+    afterwards.
+  - `get_bucket_location` is `eu-west-2`, and `get_bucket_replication` fails with
+    `ReplicationConfigurationNotFoundError` (NF-6).
 
 **Manual / sanity checks**
 
-- Check the bucket in the S3 console shows "Bucket and objects not public".
+- The bucket in the S3 console shows "Bucket and objects not public".
+- `aws lambda get-function-configuration` for the API Lambda shows `DATA_BUCKET`.
+- `curl $ApiUrl/v1/projects` still returns `{"projects": []}`: the new `common` package
+  and `python-ulid` are bundled without breaking the Lambda.
 
 ---
 
@@ -718,11 +817,42 @@ caller's identity comes only from that token (AP-3).
   Delete removes the list entry first, then every object under the project folder.
   `GET /v1/projects/{id}` lists the folder and reads `status.json` files (empty at this stage).
 - `lambdas/api/validation.py`: project name rules (length, characters).
+- `tests/resource_coverage.py`: `ApiFunction/ServiceRole/DefaultPolicy/Resource` (the API
+  Lambda's S3 policy, added in Stage 3 and mapped to `test_list_projects_returns_empty_list`
+  until now) is remapped to the full-lifecycle test in `tests/integration/test_projects.py`,
+  which reads, writes, lists and deletes under `users/{sub}/`.
+- `infra/takeoff_infra/access.py`: `Takeoff-devops-scripts` gets read access to the data
+  buckets (`DATA_BUCKETS`, Stage 3), so the integration tests can check what the API wrote:
+  `s3:ListBucket` on `arn:aws:s3:::takeoff-*-data-*` and `s3:GetObject` on
+  `arn:aws:s3:::takeoff-*-data-*/*`, both limited to `eu-west-2`. Both actions are added to
+  `REGIONAL_ACTION_EXAMPLES` in `tests/integration/test_access.py`.
 
-**AWS resources:** Lambda routes added (API Gateway keeps just its `$default` and preflight routes); no new resources.
+**Check from Stage 3:** the API Lambda's `s3:ListBucket` permission has the condition
+`s3:prefix` `users/*`. The integration tests must show that a new user's `GET /v1/projects`
+returns 200 and `{"projects": []}`, which needs S3 to answer `NoSuchKey` (not 403) for the
+missing `projects.json`. If it answers 403, remove the prefix condition from `ListBucket` in
+`infra/takeoff_infra/stacks/api.py` (the object actions stay limited to `users/*`) and update
+the Stage 3 infra test that checks it.
+
+**AWS resources:** Lambda routes added (API Gateway keeps just its `$default` and preflight
+routes); no new resources.
+
+In this order:
+
+1. `just check`.
+2. `takeoff-admin`: `just deploy-access`, which deploys a new version of
+   `Takeoff-devops-scripts`. The policy name is unchanged, so the administrator has nothing to
+   attach.
+3. `takeoff-devops`: `just deploy dev` updates the API Lambda's code.
+4. `just integration dev`.
 
 **Automated tests**
 
+- Infra (`tests/infra/test_access.py`): `Takeoff-devops-scripts` allows `s3:GetObject` only on
+  data bucket objects and `s3:ListBucket` only on the site and data buckets, and the data
+  bucket statements are limited to `eu-west-2`.
+- Integration (`tests/integration/test_access.py`): `s3:ListBucket` and `s3:GetObject` on a
+  data bucket are allowed for `takeoff-devops` in `eu-west-2` and denied in `us-east-1`.
 - Unit:
   - Create, rename, delete and list with moto.
   - The 412 retry path, using `Stubber` to return 412 once.
@@ -734,7 +864,9 @@ caller's identity comes only from that token (AP-3).
     uses the whole 10-request burst (AD-24), so the requests retry on 429 with backoff.
   - **Isolation (DA-2):** `second_test_user` gets 404 on `GET`, `PATCH` and `DELETE` of the first
     user's project, and the first user's list is unchanged.
-  - Objects land under `users/{sub}/` for the caller's real `sub`.
+  - Objects land under `users/{sub}/` for the caller's real `sub`: the test lists the
+    caller's prefix and reads `projects.json` directly from the data bucket as
+    `takeoff-devops`, and checks it matches the API's responses.
 
 **Manual / sanity checks**
 
@@ -1218,7 +1350,6 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 | --- | --- | --- | --- | --- |
 | DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 9 (before Stage 10) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
 | DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 15 (register both before it starts) | Stages 1–14 use the CloudFront and Cognito default domains; Stage 15 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Prod should open to users only after Stage 15, because the site origin changes. |
-| DN-5 | **ID format** for projects and files | Stage 3 | ULID. | `data-design.md` says "ULID/UUID". ULIDs sort by creation time, which helps when listing. |
 | DN-6 | **Sign-up and reset email sender** | Stage 4 (prod and test: Stage 15) | Cognito default sender in dev; Amazon SES on the custom domains in test and prod (Stage 15). | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
 | DN-7 | **Password policy and MFA** for email accounts | Stage 4 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
 | DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 4 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
