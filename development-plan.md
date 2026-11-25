@@ -763,55 +763,299 @@ In this order:
 
 ## Stage 4: Authentication
 
-**Goal:** AU-1 to AU-6 (AD-5).
+**Goal:** AU-1 to AU-6 (AD-5), with the pool settings in AD-26 to AD-30.
+
+Stage 4 creates the sign-in service only: the API stays unauthenticated until Stage 5, and AU-1
+(nothing but the sign-in page without signing in) is enforced by the SPA. The placeholder page
+gets a minimal sign-in and sign-out so the browser checks below can be done before the real SPA
+exists.
+
+**Before this stage.**
+
+- **Confirm the Cognito domain prefix (DN-21).** It is part of every redirect URL below, so it
+  must be settled before the Google and Facebook set-up. This stage writes it as `<prefix>`;
+  the example used is `takeoff-<env>-<account>` (`takeoff-dev-303770518256` in dev).
+- **Confirm the callback and sign-out paths** (`/auth/callback` and `/`, see the SPA client
+  below) with the front-end team.
+- **Google and Facebook set-up for dev (outside AWS, AD-29)**, owned by an organisation account
+  with a second admin. Each client or app allows dev's Cognito redirect URL,
+  `https://<prefix>.auth.eu-west-2.amazoncognito.com/oauth2/idpresponse` (the prefix is set in
+  config, so this can be done before the deploy):
+  - **Google:** the `Take-off non-prod` Google Cloud project, with its OAuth consent screen left
+    in *Testing*, `amazoncognito.com` added to its **Authorized domains**, and the people who
+    will test sign-in added as test users; and an OAuth client (web application) for dev with
+    the redirect URL under **Authorized redirect URIs**. The `Take-off` prod project is created
+    in Stage 14.
+  - **Facebook:** the Take-off prod app (created now but not made Live; Live mode is a Stage 14
+    task), and a test app for dev linked to it. A test app copies the prod app's settings only
+    when it is created, so set these **on the dev test app itself**: add the **Facebook Login**
+    product, set **App Domains** to `<prefix>.auth.eu-west-2.amazoncognito.com`, and add the
+    redirect URL under Facebook Login's **Valid OAuth Redirect URIs**. Add the people who will
+    test sign-in as testers on the dev test app.
 
 **Python files**
 
-- `infra/takeoff_infra/stacks/auth.py`: User Pool with email sign-in, email verification and
-  password reset; managed-login domain `takeoff-<env>`; Google and Facebook identity providers
-  with secrets read from Secrets Manager; SPA app client (authorization code + PKCE, no
-  secret, callback and sign-out URLs from the site URL, plus localhost in dev); a test-only
-  app client with `ADMIN_USER_PASSWORD_AUTH` (dev and test only); no account linking.
-  Outputs `UserPoolId`, `SpaClientId`, `TestClientId`, `LoginDomain`.
+- `infra/takeoff_infra/stacks/auth.py`: the `Takeoff-<env>-Auth` stack.
+  - **User Pool**, with the environment's removal policy (`RETAIN` in prod) and deletion
+    protection on in prod (a pool can't be restored from a backup, DN-17), tagged
+    `takeoff:env=<env>` (used by the IAM deny below). Settings:
+    - **Feature plan** Essentials (`feature_plan=FeaturePlan.ESSENTIALS`) (AD-26).
+    - **Self sign-up on** (`self_sign_up_enabled=True`; CDK's default is off, which would
+      break AU-4), with email addresses auto-verified (`auto_verify=AutoVerifiedAttrs(email=True)`).
+    - **Email** from Cognito's default sender (`UserPoolEmail.with_cognito()`) in every
+      environment until Stage 15 (AD-27). Email addresses are verified with a **code**
+      (`VerificationEmailStyle.CODE`), and password reset is by email only
+      (`AccountRecovery.EMAIL_ONLY`). The default sender allows about 50 emails a day for the
+      whole account, so manual sign-up tests should use only a few addresses.
+    - **Passwords** at least 12 characters, with upper case, lower case, digits and symbols
+      all *not* required, and the last 5 passwords can't be reused
+      (`password_history_size=5`); temporary passwords last the default 7 days (AD-28).
+    - **MFA** off (`Mfa.OFF`) (AD-28). With MFA off and no phone sign-in, CDK creates no SMS
+      role, so the stack has **no IAM role**.
+    - **Sign-in name and attributes** (AD-30; these can't be changed once the pool exists):
+      email is the username (`sign_in_aliases=SignInAliases(email=True)`), sign-in ignores
+      case (`sign_in_case_sensitive=False`), and no standard attribute is required: `email`
+      is optional and mutable (`StandardAttribute(required=False, mutable=True)`).
+  - **Domain**: a Cognito prefix domain `<prefix>` (to be confirmed, DN-21; for example
+    `takeoff-<env>-<account>`, `takeoff-dev-303770518256` in dev), set per environment in
+    `config.py` (`cognito_domain_prefix`), with managed login version 2
+    (`managed_login_version=ManagedLoginVersion.NEWER_MANAGED_LOGIN`, AD-26). Prefixes are
+    shared by every AWS account in the region, so a plain `takeoff-<env>` is probably taken. Version 2 shows nothing until the app client has a
+    **managed login branding** (`CfnManagedLoginBranding` with
+    `use_cognito_provided_values=True`), which the stack creates for the SPA client.
+  - **Identity providers** (AD-29, AD-30), with the client ID and secret read from Secrets
+    Manager at deploy time (`SecretValue.secrets_manager("takeoff/<env>/google",
+    json_field=…, version_id=…)`), so the template holds only `{{resolve:secretsmanager:…}}`
+    references, never a secret. Each reference names a **specific secret version**, from
+    `infra/idp_secret_versions.json`: CloudFormation reads a reference only when the resource
+    it is in changes, so a reference to "the current version" would leave Cognito with the old
+    secret after a rotation. A new version ID changes the template, so the next deploy updates
+    the provider. An environment with no entry yet (test and prod before Stage 14) still
+    synthesises, with a placeholder version, but `deploy.py` refuses to deploy it.
+    - Google requests `openid email profile` and maps `email`, `email_verified` and `name`;
+    - Facebook requests `public_profile,email` and maps `email` and `name`.
+
+    A Facebook user without an email address can still sign in, and the SPA must cope with
+    tokens that have no `email` claim (tell the front-end team). Cognito returns the client
+    secret to anyone allowed `DescribeIdentityProvider`; `takeoff-devops` isn't given that
+    action.
+  - **SPA app client**: no secret; the authorization-code grant with PKCE only; scopes
+    `openid email profile`; identity providers Cognito, Google and Facebook; no account
+    linking (AU-6). Callback URL `<site origin>/auth/callback` and sign-out URL
+    `<site origin>/`, plus the same paths on `http://localhost:5173` in dev only. Confirm
+    the two paths with the front-end team before deploying: Cognito matches them exactly.
+    Default token lifetimes (ID and access tokens 1 hour, refresh token 30 days), token
+    revocation on, and `prevent_user_existence_errors=True`. The only direct sign-in flow
+    (`ExplicitAuthFlows`) is `ALLOW_REFRESH_TOKEN_AUTH`; sign-in itself goes through managed
+    login. The manual sign-in check confirms managed login works with this; if it doesn't, add
+    `ALLOW_USER_SRP_AUTH` and update the infra test.
+  - **Test app client** (dev and test only, `config.create_test_client`): no secret,
+    `ADMIN_USER_PASSWORD_AUTH` (and refresh) only, Cognito users only, OAuth turned off
+    (`disable_o_auth=True`), `prevent_user_existence_errors=True`.
+  - Outputs `UserPoolId`, `SpaClientId`, `TestClientId` (dev and test only) and `LoginDomain`
+    (the full host name, `<prefix>.auth.eu-west-2.amazoncognito.com`).
+- `infra/takeoff_infra/config.py`: `cognito_domain_prefix` for each environment (DN-21).
+- `infra/takeoff_infra/environment.py`: `build_stacks` adds the Auth stack after Site (the
+  callback URLs take the site origin, a cross-stack reference as for Data and Api). Nothing
+  depends on Auth yet; Stage 5 makes Api depend on it.
+- `infra/takeoff_infra/access.py`:
+  - `Takeoff-cf-exec`, limited to `eu-west-2`:
+    - `cognito-idp:*` on `arn:aws:cognito-idp:eu-west-2:303770518256:userpool/*`;
+    - the Cognito actions that have no resource ARN when they are called (at least
+      `cognito-idp:CreateUserPool`, and `cognito-idp:DescribeUserPoolDomain`, which takes a
+      domain name) on `Resource: "*"`. Check the list against the Service Authorization
+      Reference when writing it; the first deploy confirms it (`cloudformation:DescribeStackEvents`
+      shows any refusal);
+    - `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret` on
+      `arn:aws:secretsmanager:eu-west-2:303770518256:secret:takeoff/*`, so CloudFormation can
+      resolve the identity providers' secret references.
+  - `Takeoff-boundary`: unchanged (no Lambda or role uses Cognito or Secrets Manager).
+  - `Takeoff-devops-scripts`, limited to `eu-west-2`, above the region deny:
+    - for the test-user fixture and the integration tests, on
+      `arn:aws:cognito-idp:eu-west-2:303770518256:userpool/*`: `cognito-idp:AdminCreateUser`,
+      `AdminSetUserPassword`, `AdminInitiateAuth`, `AdminDeleteUser`, `ListUsers`,
+      `DescribeUserPool` and `DescribeUserPoolClient`;
+    - a **deny** of `AdminCreateUser`, `AdminSetUserPassword`, `AdminInitiateAuth`,
+      `AdminDeleteUser` and `ListUsers` on pools tagged `takeoff:env=prod`
+      (`StringEquals aws:ResourceTag/takeoff:env prod`), so tests and scripts can't create,
+      sign in as or delete prod users, or list them (their email addresses and names are
+      personal data). Pool ARNs contain a random ID, so they can't be told apart by name.
+      Stage 14's smoke tests show the deny works on the real prod pool;
+    - for `set_idp_secrets.py`, on `arn:aws:secretsmanager:eu-west-2:303770518256:secret:takeoff/*`:
+      `secretsmanager:CreateSecret`, `secretsmanager:PutSecretValue` and
+      `secretsmanager:DescribeSecret`. Not `GetSecretValue`: `takeoff-devops` can write the
+      secrets but not read them back.
+
+    The allowed actions are added to `REGIONAL_ACTION_EXAMPLES` in
+    `tests/integration/test_access.py`. The `Takeoff-access` template gains no new resource
+    type, so `TakeoffAppPlatform` doesn't change.
+- `scripts/ops/set_idp_secrets.py` and a `just set-idp-secrets <env>` recipe: stores the
+  Google and Facebook client ID and secret for an environment as JSON
+  (`{"client_id": …, "client_secret": …}`) in `takeoff/<env>/google` and
+  `takeoff/<env>/facebook`, creating each secret or putting a new value. It asks for the values
+  at the prompt (secret values hidden, with `getpass`), never takes them as arguments (they would
+  land in the shell history) and never prints them. Prod needs the same typed `prod`
+  confirmation as `upload_site.py`. After writing, it records each secret's new version ID
+  (from `create_secret` or `put_secret_value`) in `infra/idp_secret_versions.json`
+  (`{"<env>": {"google": "<version id>", "facebook": "<version id>"}}`). Version IDs aren't
+  sensitive, so the file is committed. Run once per environment before its first deploy, and
+  again whenever a secret is rotated, then commit the file and run `just deploy <env>`: the
+  new version ID changes the template, so CloudFormation updates the identity provider. For
+  dev, the values come from the dev OAuth client in the `Take-off non-prod` Google
+  project and the dev Facebook test app (AD-29). The secrets are created by this script, not
+  by a stack, so they aren't in `resource_coverage.py`; the identity providers' integration
+  tests show they hold working values.
 - `scripts/dev/upload_site.py`: adds the sign-in settings to `config.json`, read from the Auth
-  stack's outputs: `region` (`eu-west-2`), `userPoolId`, `spaClientId` and `loginDomain`. It
-  never writes the test client's ID. Run `just upload-site <env> <build dir>` again after
-  deploying, so the site's `config.json` gets the new keys.
-- `scripts/ops/set_idp_secrets.py`: stores the Google and Facebook client ID and secret for an
-  environment in Secrets Manager (`takeoff/<env>/google`, `takeoff/<env>/facebook`). Run
-  once per environment before deploying.
-- `tests/conftest.py`: adds the `test_user` and `second_test_user` fixtures that create users,
-  sign them in through the test client, and delete them afterwards.
+  stack's outputs: `region` (`eu-west-2`), `userPoolId`, `spaClientId` and `loginDomain` (the
+  full host name). It never writes the test client's ID, and fails with a clear message if the
+  Auth stack has no outputs yet (as it does for `ApiUrl`). Run `just upload-site <env> <build
+  dir>` again after deploying, so the site's `config.json` gets the new keys.
+- `site_placeholder/index.html`: a minimal sign-in for the browser checks, in plain JavaScript
+  with no libraries. It reads `config.json`; *Sign in* sends the browser to
+  `https://<loginDomain>/oauth2/authorize` with a PKCE code challenge; on `/auth/callback`
+  (served by the SPA fallback) it exchanges the code at `/oauth2/token` and shows the ID token's
+  claims (`sub`, `email` if present, `name`, `identities`); *Sign out* goes to `/logout` with
+  the SPA client ID and the sign-out URL. Tokens are kept in `sessionStorage` only. The real
+  SPA replaces it.
+- `pyproject.toml`: `PyJWT[crypto]` in the `dev` group, for checking tokens against the pool's
+  JWKS in the integration tests; `uv.lock` updated.
+- `tests/conftest.py`:
+  - `test_user` and `second_test_user` fixtures: each creates `test-<uuid>@example.com` with
+    `admin_create_user` and **`MessageAction="SUPPRESS"`** (otherwise Cognito emails an
+    invitation, using the shared daily allowance and bouncing off `example.com`), with
+    `email_verified=true`; sets a random password with
+    `admin_set_user_password(Permanent=True)` (otherwise the user is left in
+    `FORCE_CHANGE_PASSWORD`); signs in through the test client with `admin_initiate_auth`;
+    and yields the user's `sub`, ID token and access token. Afterwards it deletes the user and
+    every object version under `users/{sub}/` in the data bucket (Stage 3's permissions).
+  - At the start of each integration session, a sweep deletes users whose email matches
+    `test-*@example.com` exactly (the `ListUsers` filter `email ^= "test-"`, then the
+    `@example.com` ending checked in the code) and that were created more than a day ago, with
+    their data: users left behind by a run that crashed. It never touches real testers'
+    accounts, such as `test-anna@gmail.com`.
+- `tests/resource_coverage.py`: an `Auth` entry, each resource mapped to a test in
+  `tests/integration/test_auth.py` (paths as they appear in the synthesised template):
+  - the User Pool to `test_user_pool_settings`;
+  - the domain and the managed login branding to `test_managed_login_page_returns_200`;
+  - the Google provider to `test_google_sign_in_redirects_to_google`, and the Facebook
+    provider to `test_facebook_sign_in_redirects_to_facebook`;
+  - the SPA client to `test_spa_client_settings`;
+  - in dev and test, the test client to `test_fixture_user_gets_valid_tokens`.
+- `tests/infra/test_auth.py`, `tests/unit/test_set_idp_secrets.py`,
+  `tests/integration/test_auth.py`: the tests below, plus additions to
+  `tests/infra/test_access.py`, `tests/unit/test_upload_site.py` and
+  `tests/integration/test_access.py`.
 
 **AWS resources**
 
-- Cognito User Pool, managed-login domain, Google and Facebook identity providers, two app
-  clients (one in prod), Secrets Manager secrets for each identity provider.
-- Google OAuth client and Facebook app (outside AWS), each with the environment's Cognito
-  redirect URL.
+In this order:
+
+1. `just setup` (installs `PyJWT`), then `just check`.
+2. Confirm the domain prefix (DN-21) and the callback paths, then the Google and Facebook
+   set-up for dev, all described in "Before this stage".
+3. `takeoff-admin`: `just deploy-access`, which deploys new versions of `Takeoff-cf-exec` and
+   `Takeoff-devops-scripts`. The policy names are unchanged, so the administrator has nothing
+   to attach.
+4. `takeoff-devops`: `just set-idp-secrets dev` creates `takeoff/dev/google` and
+   `takeoff/dev/facebook` in Secrets Manager (`eu-west-2`) and records their version IDs in
+   `infra/idp_secret_versions.json`; commit that file.
+5. `takeoff-devops`: `just deploy dev` creates the `Takeoff-dev-Auth` stack: the User Pool
+   (Essentials feature plan), its domain and managed login branding, the Google and Facebook
+   identity providers and the two app clients. No SES until Stage 15 (AD-27).
+6. `just upload-site dev site_placeholder`, so `config.json` gets the sign-in settings and the
+   placeholder gets its sign-in.
+7. `just integration dev`.
+8. The manual / sanity checks below.
 
 **Automated tests**
 
-- Infra: the SPA client has no secret and allows only the code grant; callback URLs are
-  correct per environment; the test client exists only in dev and test; Google and Facebook
-  providers are attached to the SPA client.
+- Infra (`tests/infra/test_auth.py`):
+  - The pool uses the Essentials feature plan and the domain uses managed login version 2,
+    with a branding for the SPA client (AD-26); self sign-up is on and email is auto-verified;
+    email comes from the Cognito default sender, verification is by code and account recovery
+    is by email only (AD-27); the password policy is a minimum of 12 characters, no
+    character-type rules, a reuse history of 5 and a 7-day temporary password; MFA is off
+    (AD-28).
+  - Email is the only sign-in alias and sign-in ignores case; no standard attribute is
+    required, and `email` is optional and mutable; the Google provider requests
+    `openid email profile` and maps `email`, `email_verified` and `name`; the Facebook provider
+    requests `public_profile,email` and maps `email` and `name` (AD-30).
+  - The domain prefix is the environment's `cognito_domain_prefix`; the pool is tagged
+    `takeoff:env=<env>`; it is retained with deletion protection in prod, and destroyed
+    without it in dev and test.
+  - Every identity provider's `client_id` and `client_secret` is exactly the expected
+    `{{resolve:secretsmanager:takeoff/<env>/<provider>:SecretString:<field>::<version id>}}`
+    reference: this environment's secret, the right JSON field, and the version ID from
+    `infra/idp_secret_versions.json`. Changing a version ID in that file changes the
+    template.
+  - The SPA client has no secret, allows only the code grant with the three scopes, and lists
+    Cognito, Google and Facebook; its only explicit auth flow is `ALLOW_REFRESH_TOKEN_AUTH`;
+    its callback and sign-out URLs are the site origin's (plus localhost in dev only);
+    `prevent_user_existence_errors` is on.
+  - The test client exists only in dev and test, has no secret, allows only
+    `ADMIN_USER_PASSWORD_AUTH` and refresh, and has OAuth turned off.
+  - The Auth stack has no IAM role.
+- Infra (`tests/infra/test_access.py`): the new `Takeoff-cf-exec` statements are limited to
+  `eu-west-2`, with `Resource: "*"` only for the named Cognito actions that need it, and
+  secret access only on `secret:takeoff/*`; `Takeoff-devops-scripts` allows only the listed
+  Cognito actions on user pools, denies the user-changing ones and `ListUsers` on pools
+  tagged `takeoff:env=prod`, and allows no `secretsmanager:GetSecretValue`; every `Takeoff-access`
+  policy stays within IAM's 6,144-character limit.
+- Unit (`tests/unit/test_set_idp_secrets.py`, with moto): the first run creates both secrets
+  with the expected JSON and records their version IDs; a second run puts a new value and
+  records the new version IDs, leaving other environments' entries unchanged; prod needs the
+  typed confirmation and no terminal cancels it; the secret values never appear in the output.
+- Unit (`tests/unit/test_deploy.py`): `deploy.py` refuses to deploy an environment that has
+  no entry in `infra/idp_secret_versions.json`.
 - Unit (`tests/unit/test_upload_site.py`): `config.json` gets `region`, `userPoolId`,
-  `spaClientId` and `loginDomain` from the Auth stack's outputs, and no `TestClientId`.
+  `spaClientId` and `loginDomain` from the Auth stack's outputs, and no `TestClientId`; a
+  missing Auth stack gives a clear error.
+- Integration (`tests/integration/test_access.py`):
+  - The new Cognito and Secrets Manager actions are allowed for `takeoff-devops` in
+    `eu-west-2` and denied in `us-east-1` (the new `REGIONAL_ACTION_EXAMPLES` entries).
+  - The policy simulator, given the context `aws:ResourceTag/takeoff:env=prod`, denies
+    `AdminCreateUser`, `AdminDeleteUser` and `ListUsers`, and allows them with
+    `takeoff:env=dev`.
 - Integration (`tests/integration/test_auth.py`):
-  - The test fixture can create a user and get ID and access tokens.
-  - Tokens verify against the pool's JWKS and contain `sub`.
-  - `/oauth2/authorize?identity_provider=Google…` redirects to `accounts.google.com`;
-    the Facebook equivalent redirects to `facebook.com`.
-  - The managed login page returns 200.
-  - `describe_user_pool` shows email verification enabled.
+  - `test_fixture_user_gets_valid_tokens`: the fixture's ID and access tokens verify against
+    the pool's JWKS (`https://cognito-idp.eu-west-2.amazonaws.com/<pool id>/.well-known/jwks.json`),
+    have this pool as issuer and the test client as audience (`aud` in the ID token,
+    `client_id` in the access token), and contain the user's `sub`.
+  - `test_google_sign_in_redirects_to_google`: `/oauth2/authorize` with the SPA client, its
+    callback URL, a PKCE challenge and `identity_provider=Google` redirects (without following
+    the redirect) to `accounts.google.com`.
+  - `test_facebook_sign_in_redirects_to_facebook`: the same with `identity_provider=Facebook`
+    redirects to `www.facebook.com`.
+  - `test_managed_login_page_returns_200`: `/oauth2/authorize` with the SPA client and no
+    `identity_provider`, following redirects, ends on the managed login page with 200.
+  - `test_user_pool_settings`: `describe_user_pool` shows self sign-up allowed
+    (`AllowAdminCreateUserOnly` false), email verification enabled, the Essentials feature
+    plan, MFA off, the AD-28 password policy, case-insensitive sign-in with email as the
+    username, and `email` neither required nor immutable in the pool's schema (so a change
+    made outside CDK is caught).
+  - `test_spa_client_settings`: `describe_user_pool_client` for the SPA client shows no
+    secret, the code grant only, and the expected callback and sign-out URLs.
 
 **Manual / sanity checks**
 
-- In a browser: sign up with email, receive the verification code, sign in, reset the
-  password, sign out.
-- Sign in with Google and with Facebook.
+- In a browser, using the placeholder's sign-in: sign up with email, receive the verification
+  code (from `no-reply@verificationemail.com`; check the spam folder too), sign in, reset the
+  password, sign out. After sign-out, *Sign in* shows the login page again rather than signing
+  straight back in (AU-5).
+- At sign-up, an 11-character password is refused and a 12-character password with only
+  lower-case letters is accepted; at reset, the current password can't be reused (AD-28).
+- The managed login pages are the newer (version 2) style (AD-26).
+- Sign in with Google and with Facebook, as people listed as test users or testers (AD-29).
+  In the Cognito console (administrator), each user has `email` and `name` filled in.
+- A Google account that isn't a test user of `Take-off non-prod`, and a Facebook account
+  with no role on the dev test app, can't sign in to dev (AD-29).
+- Sign in with Facebook after unticking the email permission (*Edit access* in the
+  Facebook dialog): sign-in succeeds, and the Cognito user has no `email` (AD-30).
+- Sign in with an email account as `Name@example…` after signing up as `name@example…`:
+  it is the same account (AD-30).
 - Sign in with Google and with an email account that use the same address, and confirm that
   two separate users exist (AU-6).
+- `config.json` on the site has the four sign-in keys and no test client ID.
 
 ---
 
@@ -1137,6 +1381,13 @@ affecting each other (AD-14).
 - `infra/takeoff_infra/stacks/api.py`: review the API throttling limits (AD-24) against the
   expected prod load before prod opens to users, and set them per environment if prod
   needs more.
+- **Sign-up abuse (review before prod opens, from Stage 4).** Self sign-up is open, and
+  Cognito's default sender allows about 50 emails a day for the whole account (AD-27), so a
+  person or bot repeatedly signing up on any environment's login page could use up the
+  allowance and block sign-ups and password resets in every environment. SES (Stage 15) raises
+  the limit but doesn't stop the abuse. Decide whether prod needs AWS WAF on the User Pool
+  (rate-based rules, regional, extra cost and `wafv2` permissions in `Takeoff-cf-exec`) or the
+  Plus feature plan's threat protection (AD-26), and record the decision.
 - `scripts/dev/power_tune.py`: runs AWS Lambda Power Tuning against the processing Lambda
   using the fixture PDFs, and prints the recommended memory size (P-4). The Power Tuning state
   machine is deployed by CDK in a dev-only stack, so its roles follow AD-17 (named
@@ -1173,7 +1424,14 @@ affecting each other (AD-14).
 
 - `tests/smoke/test_prod_smoke.py`: non-destructive checks only: site and deep link return
   200; the API returns 401 without a token; the managed login page and JWKS respond; all
-  alarms are not in `ALARM`.
+  alarms are not in `ALARM`; and `takeoff-devops` is refused `ListUsers` and
+  `AdminCreateUser` on the real prod User Pool (the Stage 4 deny on pools tagged
+  `takeoff:env=prod`; both calls are refused, so nothing is read or changed).
+- **The placeholder page in prod (from Stage 4).** The placeholder has a working sign-in and
+  sign-up, so uploading it to prod lets anyone who finds the URL create a prod account before
+  launch. Before uploading to prod, decide: upload a placeholder without sign-in to prod (for
+  example a `site_placeholder_prod/` page, or a switch in `upload_site.py`), or accept prod
+  sign-ups until Stage 15 and delete any unexpected accounts before launch.
 - `tests/integration/test_environment_isolation.py`: compares the stack outputs of all
   environments and checks that no bucket, User Pool, API or Lambda is shared, and that each
   Lambda role cannot reach another environment's bucket (IAM policy simulator).
@@ -1285,9 +1543,11 @@ How each host is served:
   `https://auth.<domain>/oauth2/idpresponse`.
 - **DNS:** alias `A` and `AAAA` records for each host. `CAA` records allow only Amazon
   (`amazon.com`) to issue certificates for either domain.
-- **Email (DN-6):** an Amazon SES domain identity for `<domain>` in `eu-west-2`, with DKIM,
-  SPF and DMARC records, used as Cognito's sender (`no-reply@<domain>`) in prod. Test uses
-  `<nonprod-domain>` the same way, so the email set-up is tried before prod.
+- **Email (AD-27):** an Amazon SES domain identity for `<domain>` in `eu-west-2`, with DKIM,
+  a custom MAIL FROM domain (SPF) and DMARC records, used as Cognito's sender
+  (`no-reply@<domain>`) in prod. Test uses `<nonprod-domain>` the same way, so the email
+  set-up is tried before prod. The account must already have SES production access
+  (requested well before this stage, AD-27).
 
 **Where each resource is managed**
 
@@ -1396,10 +1656,7 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 | # | Decision | Needed by | Current assumption / options | Notes |
 | --- | --- | --- | --- | --- |
 | DN-3 | **PDF-to-SVG library** (P-2) | End of Stage 9 (before Stage 10) | Poppler `pdftocairo -svg`. | Poppler is GPL; running it as a separate program inside a hosted-only service is the basis for accepting it. Confirm this with whoever owns licensing. Java or Rust options would change AD-4. |
-| DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 15 (register both before it starts) | Stages 1–14 use the CloudFront and Cognito default domains; Stage 15 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (DN-6). Prod should open to users only after Stage 15, because the site origin changes. |
-| DN-6 | **Sign-up and reset email sender** | Stage 4 (prod and test: Stage 15) | Cognito default sender in dev; Amazon SES on the custom domains in test and prod (Stage 15). | Cognito's default sender has a low daily limit and can't use your own From address. SES needs a verified domain (DN-4). |
-| DN-7 | **Password policy and MFA** for email accounts | Stage 4 | Cognito defaults (8+ characters, mixed case, digits, symbols); no MFA. | Not covered by the requirements. |
-| DN-8 | **Google and Facebook apps**: one per environment, or one shared with several redirect URLs | Stage 4 | One per environment. | Separate apps keep prod credentials out of dev and test. Facebook needs app review before the general public can use prod. |
+| DN-4 | **Domain names**: the prod domain, and a separate non-production domain for test (and later, if wanted, dev) | Stage 15 (register both before it starts) | Stages 1–14 use the CloudFront and Cognito default domains; Stage 15 adds `<domain>` for prod and `<nonprod-domain>` for test, as in its domain pattern. | Affects CORS origins, Cognito callback URLs, Google/Facebook redirect URLs, and SES (AD-27). Prod should open to users only after Stage 15, because the site origin changes. |
 | DN-10 | **Project name rules** and **maximum projects per user** | Stage 6 | 1–100 characters, any printable characters; no project limit. | A limit keeps `projects.json` small and fast to rewrite. |
 | DN-11 | **JSON data file names and schemas** | Stage 7 | Accept any JSON object up to 1 MB until schemas are supplied. | Must come from the front-end team. Without schemas the API checks only size and JSON syntax. |
 | DN-12 | **Average SVG size** (open question) | End of Stage 9 | Measured in Stage 9. | Decides SVG storage and download costs, and whether AD-13 browser caching is enough. |
@@ -1410,6 +1667,7 @@ the assumption is given; confirm it, or change the plan. When a decision is made
 | DN-17 | **Availability targets, backup and retention** beyond 30-day S3 versioning | Stage 14 | S3 versioning only; no cross-region copy; no Cognito backup. | Cognito user pools can't be restored from a backup, so losing the prod pool means users must sign up again. `RETAIN` and deletion protection lower that risk. |
 | DN-18 | **Compliance**: GDPR data export, account deletion, privacy notice | Before prod launch | Not built. | Account deletion would delete the Cognito user and everything under `users/{sub}/`. That's a new API route and stage. |
 | DN-19 | **Release process**: manual `cdk deploy` or a CI/CD pipeline, and how changes are promoted dev → test → prod | Stage 14 | Manual deploys from a developer machine. | A pipeline would run the infra and unit tests on every change and the integration suite before promotion. |
+| DN-21 | **Cognito domain prefix** for each environment (the `<prefix>` in `<prefix>.auth.eu-west-2.amazoncognito.com`) | Stage 4 (before the Google and Facebook set-up) | `takeoff-<env>-<account>`, for example `takeoff-dev-303770518256`. | Prefixes are shared by every AWS account in the region, so it must be unique; only lower-case letters, digits and hyphens, and not `aws`, `amazon` or `cognito`. It is part of every Google and Facebook redirect URL and of `loginDomain` in `config.json`, and users see it on the login pages until Stage 15. The example makes the account ID public, which AWS doesn't treat as secret. |
 
 ---
 
